@@ -49,7 +49,7 @@ mcp = FastMCP(
 
 def _tool_error(tool: str, err: Exception) -> dict:
     log.error("tool_error", tool=tool, error=str(err))
-    return {"error": str(err)}
+    return {"error": str(err)[:200]}
 
 
 # ---------------------------------------------------------------------------
