@@ -66,7 +66,7 @@ async def list_agents(search: str = "", limit: int = 20) -> dict:
     """
     client = get_client()
     try:
-        params: dict[str, Any] = {"limit": limit}
+        params: dict[str, Any] = {"limit": min(limit, 100)}
         if search:
             params["search"] = search
         data = await client.request("GET", "/api/agents", params=params)
@@ -106,9 +106,9 @@ async def create_agent(
     name: Optional[str] = None,
     description: Optional[str] = None,
     instructions: Optional[str] = None,
-    tools: list[str] = [],
-    conversation_starters: list[str] = [],
-    model_parameters: dict = {},
+    tools: Optional[list[str]] = None,
+    conversation_starters: Optional[list[str]] = None,
+    model_parameters: Optional[dict] = None,
 ) -> dict:
     """Create a new LibreChat agent.
 
