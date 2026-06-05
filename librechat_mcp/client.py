@@ -58,7 +58,10 @@ class LibreChatClient:
         self._http = httpx.AsyncClient(
             base_url=url,
             timeout=30.0,
-            headers={"Accept": "application/json"},
+            headers={
+                "Accept": "application/json",
+                "User-Agent": "Mozilla/5.0 (compatible; librechat-mcp/0.1.0)",
+            },
             trust_env=False,
         )
 
