@@ -1,5 +1,10 @@
 # Changelog
 
+## [0.1.1] — 2026-06-05
+
+### Fixed
+- Add `User-Agent` header to httpx client — LibreChat rejects requests without it (HLAGNT-1)
+
 ## [0.1.0] — 2026-06-05
 
 ### Added
