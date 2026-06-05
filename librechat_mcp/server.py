@@ -13,6 +13,7 @@ Tools:
 from __future__ import annotations
 
 import os
+import re
 from typing import Any, Optional
 
 import structlog
@@ -21,6 +22,15 @@ from fastmcp import FastMCP
 from .client import LibreChatConfigError, LibreChatError, get_client
 
 log = structlog.get_logger(__name__)
+
+_AGENT_ID_RE = re.compile(r"^[a-zA-Z0-9_-]+$")
+
+
+def _validate_agent_id(agent_id: str) -> Optional[str]:
+    """Return None if valid, error string if invalid."""
+    if not agent_id or not _AGENT_ID_RE.match(agent_id):
+        return f"Invalid agent_id: must match ^[a-zA-Z0-9_-]+$"
+    return None
 
 mcp = FastMCP(
     name="librechat-mcp",
@@ -79,6 +89,8 @@ async def get_agent(agent_id: str) -> dict:
     Args:
         agent_id: Agent ID from list_agents.
     """
+    if err := _validate_agent_id(agent_id):
+        return {"error": err}
     client = get_client()
     try:
         data = await client.request("GET", f"/api/agents/{agent_id}")
@@ -157,6 +169,8 @@ async def update_agent(
         conversation_starters: Suggested starter messages (replaces existing list).
         model_parameters: Model-specific parameters (replaces existing dict).
     """
+    if err := _validate_agent_id(agent_id):
+        return {"error": err}
     client = get_client()
     try:
         body: dict[str, Any] = {}
@@ -192,6 +206,8 @@ async def delete_agent(agent_id: str) -> dict:
     Args:
         agent_id: Agent ID from list_agents or create_agent.
     """
+    if err := _validate_agent_id(agent_id):
+        return {"error": err}
     client = get_client()
     try:
         data = await client.request("DELETE", f"/api/agents/{agent_id}")
