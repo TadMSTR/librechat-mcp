@@ -9,8 +9,8 @@ proactively after 6 days, or immediately on a 401 response.
 from __future__ import annotations
 
 import os
-from datetime import datetime, timedelta, timezone
-from typing import Any, Optional
+from datetime import UTC, datetime, timedelta
+from typing import Any
 
 import httpx
 import structlog
@@ -52,8 +52,8 @@ class LibreChatClient:
                 "LIBRECHAT_ADMIN_EMAIL and LIBRECHAT_ADMIN_PASSWORD are required"
             )
 
-        self._jwt: Optional[str] = None
-        self._jwt_acquired_at: Optional[datetime] = None
+        self._jwt: str | None = None
+        self._jwt_acquired_at: datetime | None = None
 
         self._http = httpx.AsyncClient(
             base_url=url,
@@ -81,14 +81,14 @@ class LibreChatClient:
         _raise_for_status(resp)
         data = resp.json()
         self._jwt = data["token"]
-        self._jwt_acquired_at = datetime.now(tz=timezone.utc)
+        self._jwt_acquired_at = datetime.now(tz=UTC)
         log.info("librechat_auth_ok")
         return self._jwt  # type: ignore[return-value]
 
     def _jwt_is_fresh(self) -> bool:
         if self._jwt is None or self._jwt_acquired_at is None:
             return False
-        age = datetime.now(tz=timezone.utc) - self._jwt_acquired_at
+        age = datetime.now(tz=UTC) - self._jwt_acquired_at
         return age < timedelta(days=_PROACTIVE_REFRESH_DAYS)
 
     async def _get_jwt(self) -> str:
@@ -123,6 +123,7 @@ class LibreChatClient:
 # Helpers
 # ------------------------------------------------------------------
 
+
 def _raise_for_status(resp: httpx.Response) -> None:
     """Raise LibreChatError for 4xx/5xx, preserving the JSON error body."""
     if resp.is_success:
@@ -136,7 +137,7 @@ def _raise_for_status(resp: httpx.Response) -> None:
 
 
 # Module-level singleton — created on first tool call, shared across calls.
-_client: Optional[LibreChatClient] = None
+_client: LibreChatClient | None = None
 
 
 def get_client() -> LibreChatClient:

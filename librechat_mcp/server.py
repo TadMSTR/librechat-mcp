@@ -14,7 +14,7 @@ from __future__ import annotations
 
 import os
 import re
-from typing import Any, Optional
+from typing import Any
 
 import structlog
 from fastmcp import FastMCP
@@ -26,11 +26,12 @@ log = structlog.get_logger(__name__)
 _AGENT_ID_RE = re.compile(r"^[a-zA-Z0-9_-]+$")
 
 
-def _validate_agent_id(agent_id: str) -> Optional[str]:
+def _validate_agent_id(agent_id: str) -> str | None:
     """Return None if valid, error string if invalid."""
     if not agent_id or not _AGENT_ID_RE.match(agent_id):
-        return f"Invalid agent_id: must match ^[a-zA-Z0-9_-]+$"
+        return "Invalid agent_id: must match ^[a-zA-Z0-9_-]+$"
     return None
+
 
 mcp = FastMCP(
     name="librechat-mcp",
@@ -47,6 +48,7 @@ mcp = FastMCP(
 # Helpers
 # ---------------------------------------------------------------------------
 
+
 def _tool_error(tool: str, err: Exception) -> dict:
     log.error("tool_error", tool=tool, error=str(err))
     return {"error": str(err)[:200]}
@@ -55,6 +57,7 @@ def _tool_error(tool: str, err: Exception) -> dict:
 # ---------------------------------------------------------------------------
 # Tools
 # ---------------------------------------------------------------------------
+
 
 @mcp.tool
 async def list_agents(search: str = "", limit: int = 20) -> dict:
@@ -103,12 +106,12 @@ async def get_agent(agent_id: str) -> dict:
 async def create_agent(
     provider: str,
     model: str,
-    name: Optional[str] = None,
-    description: Optional[str] = None,
-    instructions: Optional[str] = None,
-    tools: Optional[list[str]] = None,
-    conversation_starters: Optional[list[str]] = None,
-    model_parameters: Optional[dict] = None,
+    name: str | None = None,
+    description: str | None = None,
+    instructions: str | None = None,
+    tools: list[str] | None = None,
+    conversation_starters: list[str] | None = None,
+    model_parameters: dict | None = None,
 ) -> dict:
     """Create a new LibreChat agent.
 
@@ -147,14 +150,14 @@ async def create_agent(
 @mcp.tool
 async def update_agent(
     agent_id: str,
-    provider: Optional[str] = None,
-    model: Optional[str] = None,
-    name: Optional[str] = None,
-    description: Optional[str] = None,
-    instructions: Optional[str] = None,
-    tools: Optional[list[str]] = None,
-    conversation_starters: Optional[list[str]] = None,
-    model_parameters: Optional[dict] = None,
+    provider: str | None = None,
+    model: str | None = None,
+    name: str | None = None,
+    description: str | None = None,
+    instructions: str | None = None,
+    tools: list[str] | None = None,
+    conversation_starters: list[str] | None = None,
+    model_parameters: dict | None = None,
 ) -> dict:
     """Update a LibreChat agent (partial update — only include fields to change).
 
@@ -234,6 +237,7 @@ async def list_tools() -> dict:
 # ---------------------------------------------------------------------------
 # Entry point
 # ---------------------------------------------------------------------------
+
 
 def main() -> None:
     port = int(os.getenv("MCP_PORT", "8496"))

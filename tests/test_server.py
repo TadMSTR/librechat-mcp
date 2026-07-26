@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 
 import httpx
 import pytest
@@ -11,10 +11,10 @@ import respx
 import librechat_mcp.client as client_mod
 from librechat_mcp.client import LibreChatClient, LibreChatError, _raise_for_status
 
-
 # ---------------------------------------------------------------------------
 # _raise_for_status
 # ---------------------------------------------------------------------------
+
 
 def test_raise_for_status_success():
     resp = httpx.Response(200, json={"ok": True})
@@ -39,6 +39,7 @@ def test_raise_for_status_500():
 # ---------------------------------------------------------------------------
 # JWT auth
 # ---------------------------------------------------------------------------
+
 
 @pytest.mark.asyncio
 async def test_login_caches_token(monkeypatch):
@@ -69,7 +70,7 @@ async def test_jwt_freshness(monkeypatch):
         assert not client._jwt_is_fresh()  # no token yet
 
         client._jwt = "some-token"
-        client._jwt_acquired_at = datetime.now(tz=timezone.utc)
+        client._jwt_acquired_at = datetime.now(tz=UTC)
         assert client._jwt_is_fresh()
         await client.close()
 
@@ -93,7 +94,7 @@ async def test_request_retries_on_401(monkeypatch):
 
         client = LibreChatClient()
         client._jwt = "stale-token"
-        client._jwt_acquired_at = datetime.now(tz=timezone.utc)
+        client._jwt_acquired_at = datetime.now(tz=UTC)
 
         result = await client.request("GET", "/api/agents")
         assert result == []
@@ -104,6 +105,7 @@ async def test_request_retries_on_401(monkeypatch):
 # Tool smoke tests
 # ---------------------------------------------------------------------------
 
+
 def _fresh_client(monkeypatch):
     """Helper: reset singleton and return a pre-authed client."""
     monkeypatch.setenv("LIBRECHAT_URL", "http://librechat:3080")
@@ -112,7 +114,7 @@ def _fresh_client(monkeypatch):
     client_mod._client = None
     c = client_mod.get_client()
     c._jwt = "test-token"
-    c._jwt_acquired_at = datetime.now(tz=timezone.utc)
+    c._jwt_acquired_at = datetime.now(tz=UTC)
     return c
 
 
@@ -123,9 +125,7 @@ async def test_list_agents(monkeypatch):
     c = _fresh_client(monkeypatch)
     with respx.mock(base_url="http://librechat:3080") as mock:
         mock.get("/api/agents").mock(
-            return_value=httpx.Response(
-                200, json={"agents": [{"id": "a1", "name": "Web Search"}]}
-            )
+            return_value=httpx.Response(200, json={"agents": [{"id": "a1", "name": "Web Search"}]})
         )
         result = await srv.list_agents()
         assert result["count"] == 1
