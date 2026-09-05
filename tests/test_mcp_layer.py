@@ -51,6 +51,20 @@ TOOL_ARGUMENTS: dict[str, dict] = {
     "list_tools": {},
     "list_mcp_tools": {},
     "list_mcp_servers": {},
+    "get_agent_permissions": {"agent_id": "agent_test"},
+    "share_agent": {
+        "agent_id": "agent_test",
+        "grant": [{"type": "user", "id": "u1", "accessRoleId": "agent_viewer"}],
+    },
+    "search_principals": {"query": "pat"},
+    "get_resource_access_roles": {"resource_type": "agent"},
+    "get_effective_permissions": {},
+    "get_role_permissions": {"role": "USER"},
+    "set_role_permissions": {
+        "role": "USER",
+        "permission_type": "agents",
+        "permissions": {"SHARE": True},
+    },
 }
 
 # The shapes that break a `-> dict` tool at FastMCP's boundary. The array is the one

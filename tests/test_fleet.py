@@ -304,3 +304,216 @@ async def test_list_mcp_servers_reports_tool_count_beside_connection_state(authe
     assert by_name["searxng"]["tool_count"] == 2
     assert by_name["jobsearch"]["connectionState"] == "disconnected"
     assert by_name["jobsearch"]["tool_count"] == 1
+
+
+# ---------------------------------------------------------------------------
+# RBAC
+# ---------------------------------------------------------------------------
+
+
+def test_writable_field_list_matches_the_tool_signatures():
+    """`_AGENT_WRITABLE_FIELDS` must describe what create/update actually send.
+
+    It documents what LibreChat's zod schemas accept, and a list that drifts from the
+    signatures is worse than none — it would assert coverage the tools do not have.
+    Binding it to the real signatures makes a field added to one and not the other a
+    test failure rather than a comment that quietly went stale.
+    """
+    import inspect
+
+    create = set(inspect.signature(srv.create_agent).parameters)
+    update = set(inspect.signature(srv.update_agent).parameters)
+    documented = set(srv._AGENT_WRITABLE_FIELDS)
+
+    # `mcp_servers` is this server's own argument, not a LibreChat field — it expands
+    # into `tools`, which IS in the list.
+    assert documented <= create | {"mcp_servers"}
+    assert documented - create == set(), (
+        f"documented but not on create_agent: {documented - create}"
+    )
+    assert documented - update == set(), (
+        f"documented but not on update_agent: {documented - update}"
+    )
+    for dropped in ("isPublic", "is_promoted", "access_level", "tool_kwargs", "mcpServerNames"):
+        assert dropped not in create, f"{dropped} is silently ignored upstream — do not offer it"
+
+
+async def test_acl_tools_resolve_the_agent_id_to_the_mongo_id(authed_client):
+    """The ACL routes are keyed by `_id`, and the public id gets a 200 with nothing.
+
+    Measured on v0.8.8-rc2: `GET /api/permissions/agent/<agent_id>` returns
+    `{principals: [], public: false}` for an agent that has two principals. Only the
+    PUT rejects the wrong key. So a tool that passed the id through would tell its
+    caller "nobody has access" about an agent they own — a confident wrong answer, not
+    an error. This asserts the resolution actually happens.
+    """
+    with respx.mock(base_url=BASE_URL) as mock:
+        mock.get("/api/agents/agent_x").mock(
+            return_value=httpx.Response(200, json={"id": "agent_x", "_id": "MONGO_ID"})
+        )
+        route = mock.get("/api/permissions/agent/MONGO_ID").mock(
+            return_value=httpx.Response(
+                200,
+                json={
+                    "resourceType": "agent",
+                    "resourceId": "MONGO_ID",
+                    "principals": [{"type": "user", "id": "u1", "accessRoleId": "agent_viewer"}],
+                    "public": False,
+                },
+            )
+        )
+        result = await srv.get_agent_permissions(agent_id="agent_x")
+
+    assert route.called, "must address the ACL route by _id, not by the public agent id"
+    assert result["principals"][0]["accessRoleId"] == "agent_viewer"
+    assert result["agent_id"] == "agent_x", "the caller's own id should come back to them"
+
+
+async def test_share_agent_posts_access_role_ids_in_updated_and_removed(authed_client):
+    """Grants are named by `accessRoleId`; `permBits` is internal and is not posted.
+
+    `updated` and `removed` are separate arrays server-side, so omitting a principal
+    does not revoke it — revocation has to be its own argument.
+    """
+    with respx.mock(base_url=BASE_URL) as mock:
+        mock.get("/api/agents/agent_x").mock(
+            return_value=httpx.Response(200, json={"id": "agent_x", "_id": "MONGO_ID"})
+        )
+        route = mock.put("/api/permissions/agent/MONGO_ID").mock(
+            return_value=httpx.Response(200, json={"message": "Permissions updated successfully"})
+        )
+        await srv.share_agent(
+            agent_id="agent_x",
+            grant=[{"type": "user", "id": "u1", "accessRoleId": "agent_viewer"}],
+            revoke=[{"type": "user", "id": "u2"}],
+        )
+
+    posted = json.loads(route.calls[0].request.content)
+    assert posted["updated"] == [{"type": "user", "id": "u1", "accessRoleId": "agent_viewer"}]
+    assert posted["removed"] == [{"type": "user", "id": "u2"}]
+    assert "permBits" not in route.calls[0].request.content.decode()
+    assert "publicAccessRoleId" not in posted, "public must stay untouched unless asked for"
+
+
+async def test_share_agent_only_sends_public_when_asked(authed_client):
+    """`public_access_role_id` defaults to None = leave alone, never to a False-y set.
+
+    Sharing publicly discloses the agent's instructions, files and tools, so changing
+    it must be an explicit act rather than a side effect of any other grant.
+    """
+    with respx.mock(base_url=BASE_URL) as mock:
+        mock.get("/api/agents/agent_x").mock(
+            return_value=httpx.Response(200, json={"id": "agent_x", "_id": "MONGO_ID"})
+        )
+        route = mock.put("/api/permissions/agent/MONGO_ID").mock(
+            return_value=httpx.Response(200, json={"ok": True})
+        )
+        await srv.share_agent(agent_id="agent_x", public_access_role_id="agent_viewer")
+
+    assert json.loads(route.calls[0].request.content)["publicAccessRoleId"] == "agent_viewer"
+
+
+async def test_share_agent_refuses_a_no_op(authed_client):
+    result = await srv.share_agent(agent_id="agent_x")
+    assert "Nothing to do" in result["error"]
+
+
+async def test_share_agent_flags_the_memory_partition_on_revoke(authed_client):
+    """Revoking can strand that user's memories for the agent — say so, do not hide it."""
+    with respx.mock(base_url=BASE_URL) as mock:
+        mock.get("/api/agents/agent_x").mock(
+            return_value=httpx.Response(200, json={"id": "agent_x", "_id": "MONGO_ID"})
+        )
+        mock.put("/api/permissions/agent/MONGO_ID").mock(
+            return_value=httpx.Response(200, json={"ok": True})
+        )
+        result = await srv.share_agent(agent_id="agent_x", revoke=[{"type": "user", "id": "u2"}])
+
+    assert "memory partition" in result["note"]
+
+
+async def test_get_resource_access_roles_rejects_a_type_outside_the_closed_set(authed_client):
+    with respx.mock(base_url=BASE_URL, assert_all_called=False) as mock:
+        route = mock.get("/api/permissions/nonsense/roles")
+        result = await srv.get_resource_access_roles(resource_type="nonsense")
+
+    assert not route.called
+    assert "promptGroup" in result["error"], "the error should name the valid values"
+
+
+async def test_get_resource_access_roles_wraps_the_array(authed_client):
+    """This endpoint returns a bare array — the #672 shape, in a brand-new tool."""
+    with respx.mock(base_url=BASE_URL) as mock:
+        mock.get("/api/permissions/agent/roles").mock(
+            return_value=httpx.Response(200, json=[{"accessRoleId": "agent_viewer", "permBits": 1}])
+        )
+        result = await srv.get_resource_access_roles()
+
+    assert result == {"roles": [{"accessRoleId": "agent_viewer", "permBits": 1}], "count": 1}
+
+
+async def test_set_role_permissions_refuses_an_unknown_key_upstream_would_swallow(authed_client):
+    """Measured: `{"NOT_A_REAL_PERMISSION": true}` returns 200 and changes nothing.
+
+    Reporting that as applied is the failure this whole part exists to stop, so the
+    key set is checked against what the role actually carries before writing.
+    """
+    with respx.mock(base_url=BASE_URL, assert_all_called=False) as mock:
+        mock.get("/api/roles/USER").mock(
+            return_value=httpx.Response(
+                200, json={"permissions": {"AGENTS": {"USE": True, "SHARE": False}}}
+            )
+        )
+        write = mock.put("/api/roles/USER/agents")
+        result = await srv.set_role_permissions(
+            role="USER", permission_type="agents", permissions={"NOT_A_REAL_PERMISSION": True}
+        )
+
+    assert not write.called, "must not write a key upstream would silently drop"
+    assert "NOT_A_REAL_PERMISSION" in result["error"]
+    assert "SHARE" in result["error"], "the error should name the keys that do exist"
+
+
+async def test_set_role_permissions_reports_before_and_after(authed_client):
+    with respx.mock(base_url=BASE_URL) as mock:
+        mock.get("/api/roles/USER").mock(
+            return_value=httpx.Response(
+                200, json={"permissions": {"AGENTS": {"USE": True, "SHARE": False}}}
+            )
+        )
+        route = mock.put("/api/roles/USER/agents").mock(
+            return_value=httpx.Response(
+                200, json={"permissions": {"AGENTS": {"USE": True, "SHARE": True}}}
+            )
+        )
+        result = await srv.set_role_permissions(
+            role="USER", permission_type="agents", permissions={"SHARE": True}
+        )
+
+    assert json.loads(route.calls[0].request.content) == {"SHARE": True}, (
+        "partial body, server merges"
+    )
+    assert result["before"] == {"USE": True, "SHARE": False}
+    assert result["after"] == {"USE": True, "SHARE": True}
+    assert result["changed"] is True
+
+
+async def test_set_role_permissions_refuses_a_read_only_permission(authed_client):
+    """WEB_SEARCH and friends appear in the GET but have no write endpoint.
+
+    A tool that pretended to set them would 404 at best and mislead at worst.
+    """
+    result = await srv.set_role_permissions(
+        role="USER", permission_type="web-search", permissions={"USE": False}
+    )
+    assert "no write endpoint" in result["error"]
+
+
+async def test_get_effective_permissions_uses_the_all_route_without_an_agent(authed_client):
+    with respx.mock(base_url=BASE_URL) as mock:
+        mock.get("/api/permissions/agent/effective/all").mock(
+            return_value=httpx.Response(200, json={"MONGO_A": 15, "MONGO_B": 1})
+        )
+        result = await srv.get_effective_permissions()
+
+    assert result == {"permissions": {"MONGO_A": 15, "MONGO_B": 1}, "count": 2}
