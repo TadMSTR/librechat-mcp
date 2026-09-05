@@ -6,26 +6,177 @@ Wraps the LibreChat REST API to give forge agents programmatic CRUD access to Li
 
 ## Tools
 
-| Tool | Description | Key parameters | Returns |
-|------|-------------|----------------|---------|
-| `list_agents` | List agents, optionally filtered by name | `search` (str), `limit` (int, max 100) | `{agents: [...], count: N, has_more: bool, after?: str}` |
-| `get_agent` | Fetch a single agent by ID | `agent_id` (str) | Agent object |
-| `create_agent` | Create a new agent | `provider`, `model` (required); `name`, `description`, `instructions`, `tools`, `conversation_starters`, `model_parameters` | Created agent object |
-| `update_agent` | Partial update — only include fields to change | `agent_id` + any subset of create fields | Updated agent object |
-| `delete_agent` | Delete an agent by ID | `agent_id` | `{deleted: true, agent_id: ...}` |
-| `list_tools` | List tool capabilities available for agent creation | — | `{tools: [...]}` |
+22 tools in three groups. Every one returns a **dict** — see the return convention
+below.
 
-### `list_agents` returns a projection, not full agents
+### Agents
 
-`GET /api/agents` responds with a subset of each agent: `_id`, `id`, `name`,
-`description`, `category`, `author`, `isPublic`, `is_promoted`, `support_contact`,
-`updatedAt`. There is **no** `model`, `provider`, `tools` or `instructions`. Call
-`get_agent` per row if you need those.
+| Tool | Description | Key parameters |
+|------|-------------|----------------|
+| `list_agents` | List agents, following the pagination cursor by default | `search`, `limit`, `expand`, `follow_cursor` |
+| `get_agent` | Fetch one agent | `agent_id`, `expanded` |
+| `create_agent` | Create an agent — 28 writable fields | `provider`, `model` (required) + any writable field, `mcp_servers` |
+| `update_agent` | Partial update; only supplied fields are sent | `agent_id` + any subset of the create fields |
+| `delete_agent` | Delete an agent | `agent_id` |
+| `ensure_agent` | **Idempotent create-or-update by name** | `name`, `spec`, `mcp_servers`, `create_missing` |
+| `duplicate_agent` | Copy an agent, instructions and tools included | `agent_id` |
+| `list_agent_versions` | An agent's saved versions, oldest first | `agent_id` |
+| `revert_agent` | Restore a saved version | `agent_id`, `version_index` |
 
-It is also cursor-paginated, and this tool fetches **one page**. The result carries
-`has_more`, plus `after` when there are further pages — pass that cursor back to walk
-them. Before v0.2.0 the extra pages were dropped with no indication at all.
+### Access control
 
+| Tool | Description | Key parameters |
+|------|-------------|----------------|
+| `get_agent_permissions` | Who can use this agent | `agent_id` |
+| `share_agent` | Grant or revoke access | `agent_id`, `grant`, `revoke`, `public_access_role_id` |
+| `search_principals` | Find users/groups/roles to grant to | `query`, `limit` |
+| `get_resource_access_roles` | Valid `accessRoleId` values for a resource type | `resource_type` |
+| `get_effective_permissions` | What the calling account can actually do | `agent_id` (optional) |
+| `get_role_permissions` | A role's full feature matrix | `role` |
+| `set_role_permissions` | Change one permission type on a role | `role`, `permission_type`, `permissions` |
+
+### Discovery and validation
+
+| Tool | Description | Key parameters |
+|------|-------------|----------------|
+| `list_tools` | LibreChat's **built-in** tools | — |
+| `list_mcp_tools` | MCP server tools, keyed by server | `server` |
+| `list_mcp_servers` | Configured MCP servers with connection state | — |
+| `list_models` | Model ids per provider, enabled providers only | `enabled_only` |
+| `list_categories` | Agent-picker categories with counts | — |
+| `validate_agent_spec` | Check a spec against live lookups before writing it | `provider`, `model`, `tools`, `mcp_servers`, `category` |
+
+### Every tool returns a dict
+
+List-shaped results are wrapped as `{"<plural>": [...], "count": N}`. This is not
+cosmetic. FastMCP builds each tool's output schema from its return annotation and
+refuses to serialise a bare list, so a `-> dict` tool returning one fails **on a
+successful upstream response**. `list_tools` did exactly that and was 100% dead
+through MCP for the whole of v0.2.0 while its unit test stayed green — that test
+called the undecorated function and never crossed the boundary that breaks
+(vikunja#672).
+
+Four LibreChat endpoints return bare arrays: `/api/agents/tools`,
+`/api/agents/categories`, `/api/agents/<id>/versions` and
+`/api/permissions/agent/roles`. All four are wrapped here, and
+`tests/test_mcp_layer.py` invokes every registered tool through the MCP layer to keep
+it that way.
+
+## Things that will bite you
+
+Each of these was measured against a running LibreChat v0.8.8-rc2, and each is a case
+where the API succeeds and does not do what you asked.
+
+### `mcpServerNames` cannot be set — use `mcp_servers`
+
+It is absent from LibreChat's `agentCreateSchema`/`agentUpdateSchema` and is *derived*
+server-side from whichever `tools` entries carry the `_mcp_` delimiter:
+
+```
+tools=['search_mcp_searxng'], no mcpServerNames  ->  mcpServerNames: ['searxng']
+mcpServerNames=['searxng'], no MCP tools         ->  mcpServerNames: []
+```
+
+So `create_agent(mcp_servers=['searxng'])` expands to that server's tool pluginKeys.
+Passing `mcpServerNames` yourself returns 201 and changes nothing.
+
+### Unknown tools are dropped silently on a 201
+
+`filterAuthorizedTools` removes any tool key it does not recognise or authorise, and
+the request still succeeds — so the agent is created *without* the capability it was
+created for. `create_agent` and `update_agent` report this as `dropped_tools` plus a
+`warning`; `validate_agent_spec` catches it beforehand.
+
+### Fields LibreChat accepts and ignores
+
+`isPublic`, `is_promoted`, `access_level` and `tool_kwargs` are not in the zod schemas,
+so they are stripped silently on a 200/201. They are deliberately **not** exposed as
+parameters. Use `share_agent` for sharing — the ACL surface is the layer that works.
+
+### The ACL routes are keyed by the Mongo `_id`
+
+`/api/permissions/*` does not take the public `agent_...` id, and mostly does not say
+so:
+
+| call | with the agent `id` | with `_id` |
+|---|---|---|
+| `GET /api/permissions/agent/<x>` | 200, `principals: []` | 200, the real principals |
+| `GET .../effective` | `{permissionBits: 0}` | `{permissionBits: 15}` |
+| `PUT /api/permissions/agent/<x>` | 400 `Invalid resource ID` | 200 |
+
+The tools here take the public id and resolve `_id` internally. If you call the API
+directly, note that two of those three answer with a confident wrong answer rather
+than an error.
+
+### Pagination: the response says `after`, the request wants `cursor`
+
+The envelope reports the next cursor as `after`, but the handler reads
+`req.query.cursor`. Sending it back as `after=` is an unknown parameter, so it is
+ignored and every page is page one — with `has_more: true`, forever. `list_agents`
+sends `cursor`, and additionally stops when a page yields no new ids.
+
+### `list_agents` returns a projection
+
+`_id`, `id`, `name`, `description`, `category`, `author`, `isPublic`, `is_promoted`,
+`support_contact`, `owner_contact`, `isEditable`, `updatedAt`. There is **no** `model`,
+`provider`, `tools` or `instructions`. Pass `expand=true` (an N+1 fan-out) when you
+need something to diff a spec against.
+
+### List and dict fields replace, they do not merge
+
+`update_agent(tools=['calculator'])` on an agent with three tools leaves it with one.
+Read the current list with `get_agent` and post the union.
+
+### `memory_scope` and `skills_scope` are different vocabularies
+
+`memory_scope` is `'user' | 'agent'` — **not** a boolean. `'agent'` is the Agent
+Builder's "Keep memories separate for this agent". `skills_scope` is
+`'all' | 'selected' | 'none'`. Confusing the two gets a 400.
+
+## Provisioning a fleet
+
+`ensure_agent` is the declarative primitive: define each agent once and re-apply until
+it stops changing anything.
+
+```python
+ensure_agent(
+    name="Research",
+    spec={
+        "provider": "Mistral",  # a custom endpoint's `name:` verbatim
+        "model": "mistral-small-latest",
+        "instructions": "You research things and cite sources.",
+        "category": "general",
+        "memory_scope": "agent",  # isolate this agent's memories
+    },
+    mcp_servers=["searxng"],
+)
+# -> {"action": "created",   "agent_id": "agent_...", "changed": [...]}
+# -> {"action": "unchanged", "agent_id": "agent_...", "changed": []}   on a re-run
+```
+
+`unchanged` means **no write was issued** — the current agent is fetched and diffed
+first. That matters because LibreChat appends to `versions[]` on a real change and
+`revert_agent` walks that list, so a reconciler that PATCHed unconditionally would
+bury every meaningful revision under identical re-applications.
+
+Then share it:
+
+```python
+principal = search_principals(query="Patrick")["results"][0]
+share_agent(
+    agent_id="agent_...",
+    grant=[{"type": "user", "id": principal["id"], "accessRoleId": "agent_viewer"}],
+)
+```
+
+Grants are named by `accessRoleId` (`get_resource_access_roles` lists them), never by a
+bitmask. `grant` and `revoke` are separate arguments because omitting a principal does
+**not** revoke it.
+
+Two things to know before granting: Editor and Owner grantees can see the agent's
+system instructions, files and tools, so sharing discloses configuration as well as
+use; and an agent's memory partition is anchored to agent access, so revoking a share
+can strand that user's memories for it.
 
 **agent_id** must match `^[a-zA-Z0-9_-]+$`. IDs come from `list_agents` or `create_agent`.
 

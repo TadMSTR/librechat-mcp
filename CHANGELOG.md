@@ -1,5 +1,99 @@
 # Changelog
 
+## [0.3.0] — 2026-09-05
+
+Fleet management: `librechat-mcp` goes from 6 agent-CRUD tools to 22, covering MCP
+attachment, the RBAC surface, idempotent provisioning and call-time validation.
+
+Verified against **LibreChat `v0.8.8-rc2`** (image
+`ghcr.io/danny-avila/librechat:v0.8.8-rc2`), every tool exercised through the MCP layer
+against that running instance rather than by calling the Python functions.
+
+### Security
+
+- **`role` is validated before it reaches a URL path.** It is interpolated into
+  `/api/roles/{role}` and `/api/roles/{role}/{permission_type}`, and httpx normalises
+  `..` segments before sending, so an unvalidated value left the namespace entirely:
+  `role="../agents/agent_victim"` became `GET /api/agents/agent_victim`. Found by the
+  pre-audit baseline (IV-15). `agent_id` has carried this guard since v0.2.0.
+- **`set_role_permissions` key validation no longer disables itself on an empty block.**
+  The guard read `... if before else []`, so a role with no existing block for that
+  permission type short-circuited the check to "nothing unknown" and posted the typo'd
+  key anyway. Found by the part 4 security audit. It now falls back to a role that does
+  carry the block, and where none does it proceeds rather than failing closed — a
+  permission type LibreChat adds in a later release has no block anywhere until seeded.
+
+### Fixed
+
+- **`list_tools` was 100% dead through MCP and is now the convention.** It was annotated
+  `-> dict` and returned the bare JSON array LibreChat answers `/api/agents/tools` with,
+  so FastMCP refused it with `structured_content must be a dict or None` — *on a
+  successful upstream response*. Its unit test passed the whole time because it called
+  the undecorated function object and never crossed the boundary that breaks. Fixed with
+  an `_as_dict()` helper on every return path, so a `-> dict` tool cannot emit a list, a
+  scalar or anything else whatever upstream sends. (vikunja#672)
+- **Pagination sent the wrong parameter name.** The response envelope reports the cursor
+  as `after`; the handler reads `req.query.cursor`. An unknown query parameter is
+  ignored, so every page came back as page one with `has_more: true` and an identical
+  cursor — an infinite loop for any client that trusted it. The `last_id` fallback is
+  gone too: it is an agent id, not a cursor, and passing it re-returns the same page.
+- **`list_agents` no longer truncates silently.** It follows the cursor by default, with
+  two independent stops — a page ceiling and a no-progress guard — and reports hitting
+  either as `truncated` plus a warning.
+
+### Added
+
+- **`ensure_agent(name, spec)`** — idempotent create-or-update by name, returning
+  `created`, `updated` or `unchanged`. `unchanged` means no write was issued: the
+  current agent is fetched and diffed first, so reconciliation does not append to
+  `versions[]` and bury the revert history. Names are matched exactly (`?search=` is
+  fuzzy upstream) and a duplicate name is an error rather than a coin flip.
+- **RBAC**: `get_agent_permissions`, `share_agent`, `search_principals`,
+  `get_resource_access_roles`, `get_effective_permissions`, `get_role_permissions`,
+  `set_role_permissions`.
+- **Agent routes**: `duplicate_agent`, `revert_agent`, `list_agent_versions`, and
+  `get_agent(expanded=)`.
+- **Discovery and validation**: `list_mcp_tools`, `list_mcp_servers`, `list_models`,
+  `list_categories`, `validate_agent_spec`.
+- **Field coverage on create/update goes 8 → 28**, each round-tripped individually
+  against the live instance — including `memory_scope` (`'user'|'agent'`, per-agent
+  memory isolation), `category`, `edges`, `subagents`, `tool_options`, `tool_resources`
+  and `support_contact`.
+- **`create_agent(mcp_servers=['searxng'])`** attaches an MCP server by expanding it to
+  that server's tool pluginKeys.
+- **`tests/test_mcp_layer.py`** — a gate invoking every registered tool through the MCP
+  layer against upstream bodies that break serialisation, asserting the exercised set
+  equals the registered set. A tool added without a case fails the gate rather than
+  being silently skipped. Needs no live instance.
+
+### Changed
+
+- `LibreChatClient.request()` gains `allow_mislabelled_json`, used at exactly the two
+  `/api/endpoints` call sites: that endpoint answers `text/html; charset=utf-8` with a
+  JSON body. The SSE-error check runs first and unconditionally, so the relaxation
+  cannot pass an `Illegal request` — asserted by a test.
+- `list_models` intersects `/api/models` with `/api/endpoints`, because the former still
+  lists `anthropic` and its models with that endpoint fully disabled.
+
+### Notes on LibreChat behaviour these tools work around
+
+All measured on `v0.8.8-rc2`, all cases where the API succeeds and does not do what was
+asked:
+
+- **`mcpServerNames` cannot be set.** Absent from the zod create/update schemas and
+  derived server-side from `tools` entries carrying the `_mcp_` delimiter. Posting it
+  returns 201 and changes nothing.
+- **Unknown tools are dropped silently on a 201** by `filterAuthorizedTools`, so the
+  agent is created without the capability. Reported as `dropped_tools` + `warning`.
+- **`isPublic`, `is_promoted`, `access_level` and `tool_kwargs` are accepted and
+  ignored** — zod `'strip'` mode. Not exposed as parameters; use `share_agent`.
+- **The `/api/permissions/*` routes are keyed by the Mongo `_id`.** With the public
+  agent id, the GET returns `200 {principals: [], public: false}` and `/effective`
+  returns `{permissionBits: 0}` — wrong answers, not errors. Only the PUT rejects it.
+  These tools take the public id and resolve `_id` internally.
+- **An unknown role permission key returns 200 and changes nothing**, so
+  `set_role_permissions` validates keys against what the role carries before writing.
+
 ## [0.2.0] — 2026-09-05
 
 Every tool in this server had failed in production since it shipped. This release fixes

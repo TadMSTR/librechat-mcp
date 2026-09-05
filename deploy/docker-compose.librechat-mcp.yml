@@ -35,7 +35,7 @@ services:
     # docker-publish.yml uses `type=semver,pattern={{version}}`, which strips the
     # prefix. `ghcr.io/tadmstr/librechat-mcp:v0.2.0` is a 404 — verified against the
     # registry, after this file was first written with the wrong one.
-    image: ghcr.io/tadmstr/librechat-mcp:0.2.0
+    image: ghcr.io/tadmstr/librechat-mcp:0.3.0
     container_name: librechat-mcp
     depends_on:
       - librechat

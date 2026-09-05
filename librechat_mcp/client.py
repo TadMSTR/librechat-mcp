@@ -210,8 +210,24 @@ class LibreChatClient:
     # Request dispatch
     # ------------------------------------------------------------------
 
-    async def request(self, method: str, path: str, **kwargs: Any) -> Any:
-        """Send an authenticated request. Retries once on 401."""
+    async def request(
+        self, method: str, path: str, *, allow_mislabelled_json: bool = False, **kwargs: Any
+    ) -> Any:
+        """Send an authenticated request. Retries once on 401.
+
+        `allow_mislabelled_json` accepts a JSON body served under a non-JSON
+        content-type, and exists for exactly one measured upstream defect:
+        **`GET /api/endpoints` answers `text/html; charset=utf-8` with a JSON body**
+        on v0.8.8-rc2. Without it that endpoint is unreadable here, and it is the only
+        one that says which providers are actually enabled — `/api/models` still lists
+        `anthropic` with the endpoint fully disabled.
+
+        **It does not weaken the guard that matters.** `_decode_json` tests for an SSE
+        error body FIRST and raises on it regardless of this flag, so LibreChat's
+        200-with-`Illegal request` — the failure that hid vikunja#657 for six weeks —
+        is still caught. What is relaxed is only the positive content-type assertion,
+        per request, where a caller has opted in. The default stays fail-closed.
+        """
         token = await self._get_jwt()
         resp = await self._http.request(
             method, path, headers={"Authorization": f"Bearer {token}"}, **kwargs
@@ -225,7 +241,7 @@ class LibreChatClient:
         _raise_for_status(resp)
         if resp.status_code == 204 or not resp.content:
             return None
-        return _decode_json(resp)
+        return _decode_json(resp, allow_mislabelled_json=allow_mislabelled_json)
 
 
 # ------------------------------------------------------------------
@@ -273,7 +289,7 @@ def _raise_for_status(resp: httpx.Response) -> None:
     raise LibreChatError(resp.status_code, _error_message(resp))
 
 
-def _decode_json(resp: httpx.Response) -> Any:
+def _decode_json(resp: httpx.Response, *, allow_mislabelled_json: bool = False) -> Any:
     """Decode a JSON response body, refusing anything that is not JSON.
 
     **A 200 from this API is not proof of success.** LibreChat returns the uaParser
@@ -294,7 +310,15 @@ def _decode_json(resp: httpx.Response) -> Any:
     content_type = (resp.headers.get("content-type") or "").split(";")[0].strip().lower()
     # `application/json` plus the RFC 6839 `+json` structured suffix. Anything else,
     # including the empty string standing in for an absent header, is refused.
-    if content_type != "application/json" and not content_type.endswith("+json"):
+    #
+    # The SSE check above runs FIRST and is not conditional, which is what makes the
+    # opt-in below safe: relaxing this assertion cannot let an `Illegal request`
+    # through, because that body never reaches this line.
+    if (
+        not allow_mislabelled_json
+        and content_type != "application/json"
+        and not content_type.endswith("+json")
+    ):
         raise LibreChatError(
             resp.status_code,
             f"expected JSON, got content-type {content_type or '<absent>'}: {resp.text[:200]}",

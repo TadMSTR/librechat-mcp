@@ -10,14 +10,52 @@ plus a capability lookup used when composing new agents.
 
 ## Tools
 
-- `list_agents` — List agents, optionally filtered by `search` (max 100).
-- `get_agent` — Fetch a single agent by ID.
-- `create_agent` — Create an agent (`provider`, `model` required).
-- `update_agent` — Partial update; only supplied fields change.
-- `delete_agent` — Delete an agent by ID.
-- `list_tools` — List tool capabilities available for agent creation.
+22, listed with their parameters in README.md. Agents: `list_agents`, `get_agent`,
+`create_agent`, `update_agent`, `delete_agent`, `ensure_agent`, `duplicate_agent`,
+`list_agent_versions`, `revert_agent`. Access control: `get_agent_permissions`,
+`share_agent`, `search_principals`, `get_resource_access_roles`,
+`get_effective_permissions`, `get_role_permissions`, `set_role_permissions`.
+Discovery: `list_tools`, `list_mcp_tools`, `list_mcp_servers`, `list_models`,
+`list_categories`, `validate_agent_spec`.
 
 `agent_id` must match `^[a-zA-Z0-9_-]+$`. IDs come from `list_agents` or `create_agent`.
+
+### Every tool returns a dict — route returns through `_as_dict`
+
+FastMCP builds a tool's output schema from its return annotation and refuses to
+serialise a mismatch, so a `-> dict` tool returning a bare list fails **on a successful
+upstream response**. That was vikunja#672: `list_tools` was 100% dead through MCP for
+all of v0.2.0 while its test stayed green, because the test called the undecorated
+function and never crossed the boundary.
+
+Wrap list results as `{"<plural>": [...], "count": N}`. Four LibreChat endpoints return
+bare arrays. **A new tool must be added to `TOOL_ARGUMENTS` in
+`tests/test_mcp_layer.py`** — that module asserts the exercised set equals the
+registered set, so an omission fails the suite rather than quietly shrinking coverage.
+
+### What LibreChat accepts and then ignores
+
+The Mongoose schema is a superset and is **not** the contract. `agentCreateSchema` and
+`agentUpdateSchema` (`packages/api/src/agents/validation.ts`) are zod in `'strip'`
+mode: an undeclared key is dropped silently and the request still returns 200/201.
+Before wrapping any field, round-trip it against a live instance — a `PATCH` 200 proves
+nothing.
+
+Measured on v0.8.8-rc2 and deliberately not exposed:
+
+- `mcpServerNames` — **derived** from `tools` in `v1.js` (create :880, update :1304),
+  never read from the body. Attach via `mcp_servers=`, which expands to pluginKeys.
+- `isPublic`, `is_promoted`, `access_level`, `tool_kwargs` — accepted, stripped.
+
+Also silent: an unknown tool key is dropped by `filterAuthorizedTools` on a 201, so the
+agent is created without the capability. `_dropped_tools` surfaces it.
+
+### Two id spaces
+
+Everything under `/api/agents/*` speaks the public `agent_...` id. Everything under
+`/api/permissions/*` is keyed by the Mongo `_id`, and the GETs return an empty or zero
+result for the wrong one rather than erroring. Resolve with `_resolve_resource_id`;
+never expose `_id` to callers.
 
 ## Structure
 
@@ -110,7 +148,12 @@ Coverage is gated at `fail_under = 90`, with `observability.py` INSIDE the gate.
 
 **A green suite is not a working server.** The suite mocks LibreChat, and a mocked
 LibreChat accepts whatever User-Agent you send it — which is exactly how a wrong one
-shipped twice. Before closing anything, call a tool against the running container:
+shipped twice. `tests/test_mcp_layer.py` closes the serialisation half of that gap, but
+not the semantic half: the three defects found during part 4 — the `after`/`cursor`
+parameter name, `/api/endpoints` answering `text/html`, and the catalogue disagreeing
+with the runtime registry — were all found by running against the real instance and
+none were reachable from a mock. Before closing anything, call a tool against the
+running container:
 
 ```bash
 docker compose pull && docker compose up -d librechat-mcp   # NOT restart
