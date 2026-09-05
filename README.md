@@ -142,11 +142,11 @@ it stops changing anything.
 ensure_agent(
     name="Research",
     spec={
-        "provider": "Mistral",              # a custom endpoint's `name:` verbatim
+        "provider": "Mistral",  # a custom endpoint's `name:` verbatim
         "model": "mistral-small-latest",
         "instructions": "You research things and cite sources.",
         "category": "general",
-        "memory_scope": "agent",            # isolate this agent's memories
+        "memory_scope": "agent",  # isolate this agent's memories
     },
     mcp_servers=["searxng"],
 )
