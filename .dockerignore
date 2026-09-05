@@ -1,0 +1,42 @@
+# .dockerignore does not inherit .gitignore — every entry here is deliberate.
+#
+# The repo had none, so until v0.2.0 the build context included .venv/, tests/,
+# .git/ and any *.env present in the tree.
+
+# Rebuilt inside the image; a host copy would shadow it with the wrong architecture
+# or a stale tree.
+.venv/
+venv/
+build/
+dist/
+*.egg-info/
+
+# Caches and local test state, all present in the working tree today.
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+.coverage
+.coverage.*
+htmlcov/
+
+# Not needed at build or runtime.
+tests/
+.github/
+.git/
+.gitignore
+.vscode/
+.idea/
+
+# Never bake a secret or local state into an image layer.
+.env
+*.env
+
+# The deployed stack lives outside the repo; these describe the build and the deploy
+# target, not the runtime. deploy/ is a fragment for sysadmin to merge — it has no
+# business inside the image it describes.
+deploy/
+docker-compose*.yml
+Dockerfile
+.dockerignore

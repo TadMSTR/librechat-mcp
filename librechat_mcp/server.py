@@ -13,12 +13,17 @@ Tools:
 from __future__ import annotations
 
 import atexit
+import hmac
 import os
 import re
 from typing import Any
 
 import structlog
 from fastmcp import FastMCP
+from starlette.middleware import Middleware
+from starlette.requests import Request
+from starlette.responses import JSONResponse, Response
+from starlette.types import ASGIApp, Receive, Scope, Send
 
 from . import __version__
 from .client import LibreChatConfigError, LibreChatError, get_client
@@ -32,6 +37,19 @@ from .observability import configure_logging, get_tracer, instrument, shutdown_o
 log = structlog.get_logger("librechat-mcp.server")
 
 _AGENT_ID_RE = re.compile(r"^[a-zA-Z0-9_-]+$")
+
+# HTTP transport is this server's only transport, and the tools behind it are full
+# agent CRUD — create, update and delete, against the instance the whole fleet is
+# built on. Until v0.2.0 there was no authentication at all: an unauthenticated
+# `initialize` returned 200 from a throwaway container on `librechat-internal`, the
+# same network the LibreChat app itself sits on. Fail closed.
+_MIN_API_TOKEN_LENGTH = 16
+
+# The only path that answers without a bearer token. Exact match against
+# scope["path"], never a prefix test: startswith("/health") would also exempt
+# /healthz, /health-debug and anything else someone later adds under that stem.
+# This is a closed list of one entry, not a namespace.
+_AUTH_EXEMPT_PATHS = frozenset({"/health"})
 
 
 def _validate_agent_id(agent_id: str) -> str | None:
@@ -305,6 +323,71 @@ async def list_tools() -> dict:
 
 
 # ---------------------------------------------------------------------------
+# Liveness and authentication
+# ---------------------------------------------------------------------------
+
+
+@mcp.custom_route("/health", methods=["GET"])
+async def liveness(_request: Request) -> JSONResponse:
+    """Liveness probe for the container HEALTHCHECK. Unauthenticated by design.
+
+    It answers for *this process* and deliberately does not touch LibreChat. A
+    readiness-style probe that reached upstream would mark this container unhealthy
+    whenever LibreChat restarted, and compose would then restart a process that was
+    working perfectly — trading a LibreChat blip for a librechat-mcp outage. This
+    server is stateless and re-authenticates per request, so it needs no restart to
+    recover. If a readiness signal is ever wanted, add a separate `/ready`.
+
+    Unauthenticated means the body is public. It carries a literal status and nothing
+    else: no version, no bind address, no `LIBRECHAT_URL`, no account email. This is
+    the one route that answers without a token, so anything echoed here is echoed to
+    anything that can reach the port.
+    """
+    return JSONResponse({"status": "ok"})
+
+
+class _BearerAuthMiddleware:
+    """ASGI middleware enforcing static bearer token authentication.
+
+    Requests missing a valid Authorization header receive 401. Non-HTTP scopes
+    (lifespan, websocket) pass through unconditionally, as do the paths in
+    `_AUTH_EXEMPT_PATHS` — currently `/health` alone, which the container HEALTHCHECK
+    calls before it could possibly hold a token.
+    """
+
+    def __init__(self, app: ASGIApp, token: str) -> None:
+        self._app = app
+        self._token = token
+
+    async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
+        if scope["type"] == "http" and scope.get("path") not in _AUTH_EXEMPT_PATHS:
+            request = Request(scope, receive)
+            auth_header = request.headers.get("authorization", "")
+            # Sliced by length, NOT `removeprefix("Bearer ")`. The scheme test below
+            # is case-insensitive (RFC 7235 §2.1 makes the scheme so), and pairing it
+            # with a case-SENSITIVE strip means a conformant `bearer <token>` passes
+            # the test and then fails the comparison, because the literal "bearer "
+            # is still attached to what gets compared. Rejecting a valid client, for
+            # no security gain. Found by test, not by review.
+            _SCHEME = "bearer "
+            provided = (
+                auth_header[len(_SCHEME) :] if auth_header.lower().startswith(_SCHEME) else ""
+            )
+            # compare_digest, not `==`: a plain comparison short-circuits on the
+            # first differing byte and leaks the token's prefix by timing.
+            if not hmac.compare_digest(provided, self._token):
+                response = Response(
+                    content='{"error":"Unauthorized"}',
+                    status_code=401,
+                    media_type="application/json",
+                    headers={"WWW-Authenticate": "Bearer"},
+                )
+                await response(scope, receive, send)
+                return
+        await self._app(scope, receive, send)
+
+
+# ---------------------------------------------------------------------------
 # Entry point
 # ---------------------------------------------------------------------------
 
@@ -319,8 +402,35 @@ def main() -> None:
     atexit.register(shutdown_observability)
 
     port = int(os.getenv("MCP_PORT", "8496"))
+    api_token = os.environ.get("LIBRECHAT_MCP_API_TOKEN")
+
+    # These two REFUSE rather than warn. A log line is not an access control: nothing
+    # sees it unless someone is already tailing startup output, and the process would
+    # serve full agent CRUD — including delete_agent — in the meantime.
+    if not api_token:
+        raise RuntimeError(
+            "Refusing to start librechat-mcp without LIBRECHAT_MCP_API_TOKEN set. "
+            "This server exposes agent CRUD including delete_agent, and binds 0.0.0.0 "
+            "inside its container where anything on the same Docker network can reach "
+            "it. Generate a token with: "
+            'python3 -c "import secrets; print(secrets.token_hex(32))"'
+        )
+    if len(api_token) < _MIN_API_TOKEN_LENGTH:
+        raise RuntimeError(
+            f"LIBRECHAT_MCP_API_TOKEN is too short ({len(api_token)} chars, need "
+            f">= {_MIN_API_TOKEN_LENGTH}). "
+            'Generate one with: python3 -c "import secrets; print(secrets.token_hex(32))"'
+        )
+
+    # 0.0.0.0 is required for the server to be reachable from outside its own network
+    # namespace, and is NOT the exposure decision — a bind address is a no-op as a
+    # security control inside a namespace, and binding the container's own loopback
+    # makes it unreachable even through the compose publish (measured: connection
+    # refused). The `ports:` publish is the network control; this token is the
+    # access control.
+    middleware: list[Any] = [Middleware(_BearerAuthMiddleware, token=api_token)]
     log.info("librechat_mcp_starting", port=port, version=__version__)
-    mcp.run(transport="streamable-http", host="0.0.0.0", port=port)
+    mcp.run(transport="streamable-http", host="0.0.0.0", port=port, middleware=middleware)
 
 
 if __name__ == "__main__":  # pragma: no cover
