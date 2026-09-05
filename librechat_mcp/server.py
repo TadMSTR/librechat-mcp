@@ -49,9 +49,44 @@ mcp = FastMCP(
 # ---------------------------------------------------------------------------
 
 
+# Why `get_client()` is called INSIDE each tool's try block rather than above it.
+#
+# `LibreChatConfigError` is raised there, on first use — and until v0.2.0 the call
+# sat outside the block while the `except` clause explicitly named that class. The
+# guard was unreachable: it named an exception the block could not see, so a missing
+# LIBRECHAT_URL escaped as a traceback exactly like the JSONDecodeError did. Landing
+# a guard is not the same as reaching it.
+_CLIENT_INSIDE_TRY = "see the note above _tool_error"
+
+
 def _tool_error(tool: str, err: Exception) -> dict:
-    log.error("tool_error", tool=tool, error=str(err))
-    return {"error": str(err)[:200]}
+    """Turn any exception into a structured error dict. No tool may raise.
+
+    Anything escaping a tool reaches the MCP layer as a raw traceback, and that is
+    how vikunja#657 stayed invisible for six weeks: `resp.json()` raised
+    `json.JSONDecodeError` on LibreChat's 200-with-an-SSE-error-body, that class was
+    not in the old `except (LibreChatError, LibreChatConfigError)` clause, and the
+    caller got `Expecting value: line 1 column 1 (char 0)` with nothing logged and
+    nothing measured. The clauses are now `except Exception` for exactly that reason.
+    """
+    expected = isinstance(err, LibreChatError | LibreChatConfigError)
+    # An unexpected exception gets a traceback: by definition we did not anticipate
+    # it, and the class name alone will not say which line produced it. An expected
+    # one does not — its message IS the diagnosis, and a traceback on every failed
+    # tool call would bury the signal in the logs meant to surface it.
+    log.error(
+        "tool_error",
+        tool=tool,
+        error_type=type(err).__name__,
+        error=str(err),
+        expected=expected,
+        exc_info=not expected,
+    )
+    # An unexpected error's class is part of the diagnosis, so the caller gets it
+    # too; an expected one already names itself. Truncation retained from the F-03
+    # fix — error text can carry response bodies and a tool result is model-visible.
+    message = str(err) if expected else f"{type(err).__name__}: {err}"
+    return {"error": message[:200]}
 
 
 # ---------------------------------------------------------------------------
@@ -63,12 +98,22 @@ def _tool_error(tool: str, err: Exception) -> dict:
 async def list_agents(search: str = "", limit: int = 20) -> dict:
     """List LibreChat agents.
 
+    Returns a PROJECTION, not full agent objects — only `_id`, `id`, `name`,
+    `description`, `category`, `author`, `isPublic`, `is_promoted`,
+    `support_contact` and `updatedAt`. There is no `model`, `provider`, `tools` or
+    `instructions` here; call `get_agent` for those.
+
+    The result carries `has_more`, and `after` when there are further pages. The
+    endpoint is cursor-paginated and this tool does not walk the cursor — one call
+    is one page. Reporting the cursor rather than following it keeps the tool a
+    single request while removing the silent half of the truncation.
+
     Args:
         search: Optional search string to filter agents by name.
-        limit: Maximum number of agents to return (default 20).
+        limit: Maximum number of agents to return per page (default 20, max 100).
     """
-    client = get_client()
     try:
+        client = get_client()  # inside the try — see _CLIENT_INSIDE_TRY
         params: dict[str, Any] = {"limit": min(limit, 100)}
         if search:
             params["search"] = search
@@ -79,9 +124,20 @@ async def list_agents(search: str = "", limit: int = 20) -> dict:
             agents = data.get("agents", data.get("data", []))
         else:
             agents = []
-        log.info("list_agents", count=len(agents), search=search or None)
-        return {"agents": agents, "count": len(agents)}
-    except (LibreChatError, LibreChatConfigError) as e:
+        # Envelope on v0.8.8-rc2: {object, data, first_id, last_id, has_more, after}.
+        # `after` is the documented cursor; `last_id` is the fallback for a response
+        # that reports has_more without one.
+        has_more = bool(data.get("has_more")) if isinstance(data, dict) else False
+        result: dict[str, Any] = {
+            "agents": agents,
+            "count": len(agents),
+            "has_more": has_more,
+        }
+        if has_more:
+            result["after"] = data.get("after") or data.get("last_id")
+        log.info("list_agents", count=len(agents), search=search or None, has_more=has_more)
+        return result
+    except Exception as e:
         return _tool_error("list_agents", e)
 
 
@@ -94,11 +150,11 @@ async def get_agent(agent_id: str) -> dict:
     """
     if err := _validate_agent_id(agent_id):
         return {"error": err}
-    client = get_client()
     try:
+        client = get_client()  # inside the try — see _CLIENT_INSIDE_TRY
         data = await client.request("GET", f"/api/agents/{agent_id}")
         return data or {}
-    except (LibreChatError, LibreChatConfigError) as e:
+    except Exception as e:
         return _tool_error("get_agent", e)
 
 
@@ -125,8 +181,8 @@ async def create_agent(
         conversation_starters: Suggested starter messages shown in the UI.
         model_parameters: Model-specific parameters (temperature, max_tokens, etc.).
     """
-    client = get_client()
     try:
+        client = get_client()  # inside the try — see _CLIENT_INSIDE_TRY
         body: dict[str, Any] = {"provider": provider, "model": model}
         if name is not None:
             body["name"] = name
@@ -143,7 +199,7 @@ async def create_agent(
         data = await client.request("POST", "/api/agents", json=body)
         log.info("create_agent", name=name, provider=provider, model=model)
         return data or {}
-    except (LibreChatError, LibreChatConfigError) as e:
+    except Exception as e:
         return _tool_error("create_agent", e)
 
 
@@ -174,8 +230,8 @@ async def update_agent(
     """
     if err := _validate_agent_id(agent_id):
         return {"error": err}
-    client = get_client()
     try:
+        client = get_client()  # inside the try — see _CLIENT_INSIDE_TRY
         body: dict[str, Any] = {}
         if provider is not None:
             body["provider"] = provider
@@ -198,7 +254,7 @@ async def update_agent(
         data = await client.request("PATCH", f"/api/agents/{agent_id}", json=body)
         log.info("update_agent", agent_id=agent_id, fields=list(body.keys()))
         return data or {}
-    except (LibreChatError, LibreChatConfigError) as e:
+    except Exception as e:
         return _tool_error("update_agent", e)
 
 
@@ -211,12 +267,12 @@ async def delete_agent(agent_id: str) -> dict:
     """
     if err := _validate_agent_id(agent_id):
         return {"error": err}
-    client = get_client()
     try:
+        client = get_client()  # inside the try — see _CLIENT_INSIDE_TRY
         data = await client.request("DELETE", f"/api/agents/{agent_id}")
         log.info("delete_agent", agent_id=agent_id)
         return data if data is not None else {"deleted": True, "agent_id": agent_id}
-    except (LibreChatError, LibreChatConfigError) as e:
+    except Exception as e:
         return _tool_error("delete_agent", e)
 
 
@@ -226,11 +282,11 @@ async def list_tools() -> dict:
 
     Returns the set of tool names that can be passed to create_agent or update_agent.
     """
-    client = get_client()
     try:
+        client = get_client()  # inside the try — see _CLIENT_INSIDE_TRY
         data = await client.request("GET", "/api/agents/tools")
         return data if data is not None else {}
-    except (LibreChatError, LibreChatConfigError) as e:
+    except Exception as e:
         return _tool_error("list_tools", e)
 
 

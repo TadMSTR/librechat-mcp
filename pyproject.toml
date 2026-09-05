@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "librechat-mcp"
-version = "0.1.0"
+dynamic = ["version"]
 description = "FastMCP server for LibreChat agent management"
 readme = "README.md"
 requires-python = ">=3.11"
@@ -21,7 +21,19 @@ dev = [
     "pytest-asyncio>=0.23",
     "pytest-cov>=5.0",
     "respx>=0.20",
+    # Applies LibreChat's actual rule to the User-Agent we send, rather than
+    # comparing it against a constant — see tests/test_user_agent.py for why this
+    # corroborates the live measurement instead of replicating it, and for the
+    # negative control that makes it load-bearing.
+    "ua-parser>=1.0",
 ]
+
+# Read from librechat_mcp/__init__.py so the version has exactly one home.
+[tool.setuptools.dynamic]
+version = {attr = "librechat_mcp.__version__"}
+
+[tool.setuptools.packages.find]
+include = ["librechat_mcp*"]
 
 [project.scripts]
 librechat-mcp = "librechat_mcp.server:main"
