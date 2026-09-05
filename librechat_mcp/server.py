@@ -85,6 +85,39 @@ mcp = FastMCP(
 _CLIENT_INSIDE_TRY = "see the note above _tool_error"
 
 
+def _as_dict(data: Any, *, plural: str) -> dict:
+    """Coerce any upstream payload into the dict a `-> dict` tool must return.
+
+    **This is the fix for vikunja#672, and it is a convention rather than a patch.**
+    FastMCP builds each tool's output schema from its return annotation and refuses
+    to serialise anything that does not match: a `-> dict` tool returning a list
+    fails with `structured_content must be a dict or None` — *on a successful
+    upstream response*. `list_tools` did exactly that and was 100% dead through MCP
+    for the whole of v0.2.0, while its unit test passed because it called the
+    undecorated function and so never crossed the boundary that breaks.
+
+    Four endpoints wrapped by this server return bare JSON arrays — measured live on
+    v0.8.8-rc2: `/api/agents/tools`, `/api/agents/categories`,
+    `/api/agents/<id>/versions` and `/api/permissions/agent/roles`. Each would have
+    reproduced #672 verbatim if returned unwrapped, which is why this lands before
+    the tools that wrap them rather than after.
+
+    The scalar branch is not defensive padding: a bare string or number breaks
+    FastMCP exactly as a list does, and the point of routing every return through one
+    helper is that no upstream shape — including one nobody has seen yet — can escape
+    as a non-dict. The five tools that shipped in v0.2.0 returning `data or {}` were
+    safe only because upstream happens to send objects today. That is a coincidence,
+    not a guarantee.
+    """
+    if data is None:
+        return {}
+    if isinstance(data, dict):
+        return data
+    if isinstance(data, list):
+        return {plural: data, "count": len(data)}
+    return {plural: [data], "count": 1}
+
+
 def _tool_error(tool: str, err: Exception) -> dict:
     """Turn any exception into a structured error dict. No tool may raise.
 
@@ -181,7 +214,7 @@ async def get_agent(agent_id: str) -> dict:
     try:
         client = get_client()  # inside the try — see _CLIENT_INSIDE_TRY
         data = await client.request("GET", f"/api/agents/{agent_id}")
-        return data or {}
+        return _as_dict(data, plural="agents")
     except Exception as e:
         return _tool_error("get_agent", e)
 
@@ -227,7 +260,7 @@ async def create_agent(
             body["model_parameters"] = model_parameters
         data = await client.request("POST", "/api/agents", json=body)
         log.info("create_agent", name=name, provider=provider, model=model)
-        return data or {}
+        return _as_dict(data, plural="agents")
     except Exception as e:
         return _tool_error("create_agent", e)
 
@@ -283,7 +316,7 @@ async def update_agent(
             return {"error": "No fields to update — provide at least one field to change"}
         data = await client.request("PATCH", f"/api/agents/{agent_id}", json=body)
         log.info("update_agent", agent_id=agent_id, fields=list(body.keys()))
-        return data or {}
+        return _as_dict(data, plural="agents")
     except Exception as e:
         return _tool_error("update_agent", e)
 
@@ -302,7 +335,9 @@ async def delete_agent(agent_id: str) -> dict:
         client = get_client()  # inside the try — see _CLIENT_INSIDE_TRY
         data = await client.request("DELETE", f"/api/agents/{agent_id}")
         log.info("delete_agent", agent_id=agent_id)
-        return data if data is not None else {"deleted": True, "agent_id": agent_id}
+        if data is None:
+            return {"deleted": True, "agent_id": agent_id}
+        return _as_dict(data, plural="deleted")
     except Exception as e:
         return _tool_error("delete_agent", e)
 
@@ -310,14 +345,20 @@ async def delete_agent(agent_id: str) -> dict:
 @mcp.tool
 @instrument("list_tools")
 async def list_tools() -> dict:
-    """List available LibreChat agent tools and capabilities.
+    """List LibreChat's BUILT-IN agent tools.
 
-    Returns the set of tool names that can be passed to create_agent or update_agent.
+    Returns `{"tools": [...], "count": N}`. Each entry carries a `pluginKey`, and it
+    is the `pluginKey` — not the display `name` — that goes in `create_agent(tools=)`.
+
+    **This does not list MCP server tools.** Measured on v0.8.8-rc2: this endpoint
+    returns 13 built-in tools (`calculator`, `google`, `dalle`, …) and no MCP tool at
+    all. To attach an MCP server to an agent, use `list_mcp_tools` and pass those
+    `pluginKey`s — see the note on `create_agent(mcp_servers=)`.
     """
     try:
         client = get_client()  # inside the try — see _CLIENT_INSIDE_TRY
         data = await client.request("GET", "/api/agents/tools")
-        return data if data is not None else {}
+        return _as_dict(data, plural="tools")
     except Exception as e:
         return _tool_error("list_tools", e)
 

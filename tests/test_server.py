@@ -365,18 +365,50 @@ async def test_delete_agent_passes_a_body_through_when_one_is_returned(authed_cl
         assert await srv.delete_agent("agent_abc") == {"deleted": "agent_abc"}
 
 
-async def test_list_tools_returns_the_capability_list(authed_client):
+async def test_list_tools_wraps_the_array_through_the_mcp_layer(mcp_call):
+    """vikunja#672. Going through `mcp_call` rather than the function IS the test.
+
+    LibreChat answers `GET /api/agents/tools` with a bare JSON array. `list_tools` is
+    annotated `-> dict`, so returning that array unwrapped fails FastMCP's
+    structured-content validation, and the tool was 100% dead through MCP for the
+    whole of v0.2.0.
+
+    Its predecessor asserted `await srv.list_tools() == [{"pluginKey": "web_search"}]`
+    against the *undecorated function*, which never crosses the serialisation
+    boundary. It passed for the entire time the tool was dead, and it encoded the list
+    return as correct. Calling the registered tool is what turns this from evidence of
+    the wrong thing into evidence.
+    """
     with respx.mock(base_url=BASE_URL) as mock:
         mock.get("/api/agents/tools").mock(
             return_value=httpx.Response(200, json=[{"pluginKey": "web_search"}])
         )
-        assert await srv.list_tools() == [{"pluginKey": "web_search"}]
+        assert await mcp_call("list_tools") == {
+            "tools": [{"pluginKey": "web_search"}],
+            "count": 1,
+        }
 
 
 async def test_list_tools_returns_an_empty_dict_for_an_empty_body(authed_client):
     with respx.mock(base_url=BASE_URL) as mock:
         mock.get("/api/agents/tools").mock(return_value=httpx.Response(204))
         assert await srv.list_tools() == {}
+
+
+async def test_as_dict_never_lets_a_non_dict_escape():
+    """The convention itself, asserted directly rather than only via its call sites.
+
+    A list, a scalar and None all break a `-> dict` tool at FastMCP's boundary in
+    exactly the same way. Only the list case has ever been observed in production —
+    which is the argument for asserting the other two here rather than waiting for an
+    upstream shape change to find them.
+    """
+    assert srv._as_dict(None, plural="things") == {}
+    assert srv._as_dict({"a": 1}, plural="things") == {"a": 1}
+    assert srv._as_dict([1, 2], plural="things") == {"things": [1, 2], "count": 2}
+    assert srv._as_dict([], plural="things") == {"things": [], "count": 0}
+    assert srv._as_dict("bare", plural="things") == {"things": ["bare"], "count": 1}
+    assert srv._as_dict(7, plural="things") == {"things": [7], "count": 1}
 
 
 # ---------------------------------------------------------------------------
