@@ -1116,3 +1116,117 @@ async def test_role_cannot_traverse_out_of_the_roles_namespace(role, authed_clie
     ):
         result = await getattr(srv, tool)(role=role, **extra)
         assert "Invalid role" in result["error"], f"{tool} accepted {role!r}"
+
+
+# ---------------------------------------------------------------------------
+# set_role_permissions key validation — the part 4 audit's Low finding
+# ---------------------------------------------------------------------------
+
+
+async def test_key_validation_falls_back_when_the_roles_block_is_empty(authed_client):
+    """The guard must not disable itself exactly when it has nothing to compare against.
+
+    Its first revision read `unknown = ... if before else []`, so an empty permission
+    block short-circuited the check to "nothing unknown" and posted the typo'd key
+    anyway. Not reachable on forge today — all eight writable types are populated on
+    both roles — but a permission type LibreChat *adds* in a later release has no block
+    on an existing role until something seeds it.
+    """
+    with respx.mock(base_url=BASE_URL, assert_all_called=False) as mock:
+        mock.get("/api/roles/USER").mock(
+            return_value=httpx.Response(200, json={"permissions": {"AGENTS": {}}})
+        )
+        admin = mock.get("/api/roles/ADMIN").mock(
+            return_value=httpx.Response(
+                200, json={"permissions": {"AGENTS": {"USE": True, "SHARE": False}}}
+            )
+        )
+        write = mock.put("/api/roles/USER/agents")
+        result = await srv.set_role_permissions(
+            role="USER", permission_type="agents", permissions={"NOT_REAL": True}
+        )
+
+    assert admin.called, "must consult a role that carries the block"
+    assert not write.called, "must not post a key upstream would silently drop"
+    assert "NOT_REAL" in result["error"]
+    assert "ADMIN.AGENTS has" in result["error"], "the error should name where the keys came from"
+
+
+async def test_key_validation_does_not_reject_a_valid_key_via_the_fallback(authed_client):
+    """The fallback must permit as well as refuse, or it is just a broken gate."""
+    with respx.mock(base_url=BASE_URL) as mock:
+        mock.get("/api/roles/USER").mock(
+            return_value=httpx.Response(200, json={"permissions": {"AGENTS": {}}})
+        )
+        mock.get("/api/roles/ADMIN").mock(
+            return_value=httpx.Response(
+                200, json={"permissions": {"AGENTS": {"USE": True, "SHARE": False}}}
+            )
+        )
+        write = mock.put("/api/roles/USER/agents").mock(
+            return_value=httpx.Response(200, json={"permissions": {"AGENTS": {"SHARE": True}}})
+        )
+        result = await srv.set_role_permissions(
+            role="USER", permission_type="agents", permissions={"SHARE": True}
+        )
+
+    assert write.called
+    assert result["after"] == {"SHARE": True}
+
+
+async def test_key_validation_does_not_consult_admin_when_the_block_is_populated(authed_client):
+    """The happy path must be unchanged — no extra request on every call."""
+    with respx.mock(base_url=BASE_URL, assert_all_called=False) as mock:
+        mock.get("/api/roles/USER").mock(
+            return_value=httpx.Response(
+                200, json={"permissions": {"AGENTS": {"USE": True, "SHARE": False}}}
+            )
+        )
+        admin = mock.get("/api/roles/ADMIN")
+        mock.put("/api/roles/USER/agents").mock(
+            return_value=httpx.Response(200, json={"permissions": {"AGENTS": {"SHARE": True}}})
+        )
+        await srv.set_role_permissions(
+            role="USER", permission_type="agents", permissions={"SHARE": True}
+        )
+
+    assert not admin.called
+
+
+async def test_key_validation_does_not_consult_admin_about_itself(authed_client):
+    """Setting ADMIN with an empty block must not re-fetch the role it is already reading."""
+    with respx.mock(base_url=BASE_URL) as mock:
+        role = mock.get("/api/roles/ADMIN").mock(
+            return_value=httpx.Response(200, json={"permissions": {"AGENTS": {}}})
+        )
+        mock.put("/api/roles/ADMIN/agents").mock(
+            return_value=httpx.Response(200, json={"permissions": {"AGENTS": {"SHARE": True}}})
+        )
+        await srv.set_role_permissions(
+            role="ADMIN", permission_type="agents", permissions={"SHARE": True}
+        )
+
+    assert len(role.calls) == 1, "one read, not a self-referential second one"
+
+
+async def test_key_validation_proceeds_when_no_role_carries_the_block(authed_client):
+    """With no live key set anywhere, refusing would block a legitimate first write.
+
+    A brand-new permission type is exactly the case where nothing has a block yet, so
+    failing closed here would make the tool unusable for the change it exists for. The
+    returned `changed` field still tells the caller whether anything took effect.
+    """
+    with respx.mock(base_url=BASE_URL) as mock:
+        mock.get("/api/roles/USER").mock(return_value=httpx.Response(200, json={"permissions": {}}))
+        mock.get("/api/roles/ADMIN").mock(
+            return_value=httpx.Response(200, json={"permissions": {}})
+        )
+        write = mock.put("/api/roles/USER/agents").mock(
+            return_value=httpx.Response(200, json={"permissions": {"AGENTS": {"USE": True}}})
+        )
+        result = await srv.set_role_permissions(
+            role="USER", permission_type="agents", permissions={"USE": True}
+        )
+
+    assert write.called
+    assert result["changed"] is True

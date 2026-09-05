@@ -1019,6 +1019,12 @@ _ROLE_PERMISSION_TYPES = {
     "skills": "SKILLS",
 }
 
+# The role consulted for a permission type's KEY NAMES when the target role has no
+# block for it. ADMIN is one of LibreChat's two seeded default roles and is the
+# fully-populated one, so it is the best available live source — and being live, it
+# cannot drift from the schema the way a hardcoded key roster would.
+_REFERENCE_ROLE = "ADMIN"
+
 # Readable in `GET /api/roles/<ROLE>` but with no write endpoint on that router.
 # Offering a tool that pretends to set them would report success and do nothing.
 _READ_ONLY_ROLE_PERMISSIONS = (
@@ -1342,14 +1348,35 @@ async def set_role_permissions(role: str, permission_type: str, permissions: dic
 
         # Upstream drops an unknown key on a 200, so a typo would report success and
         # change nothing. The role's own current keys are the authoritative set: they
-        # are what the server merges into, and reading them needs no second source
+        # are what the server merges into, and reading them needs no separate roster
         # that could drift from the schema.
-        unknown = sorted(set(permissions) - set(before)) if before else []
+        #
+        # **But an empty block yields an empty key set, and the first revision of this
+        # guard read `if before else []` — so it disabled ITSELF exactly when it had
+        # nothing to compare against.** Found by the part 4 security audit against the
+        # audit request's own scope hint. Not reachable on forge today (all eight
+        # writable types are populated on both roles, measured), but a permission type
+        # LibreChat *adds* in a later release has no block on an existing role until
+        # something seeds it — and this programme has an open rc→final move (#676).
+        #
+        # So: fall back to a role that does carry the block. ADMIN is one of
+        # LibreChat's two seeded default roles and is the fully-populated one. If that
+        # is also empty the key set is genuinely unknowable here, and the answer is to
+        # SAY the check did not run rather than to skip it silently — a guard that
+        # vanishes without a word is what produced this finding.
+        reference = before
+        validation_source = role
+        if not reference and role != _REFERENCE_ROLE:
+            admin = await client.request("GET", f"/api/roles/{_REFERENCE_ROLE}")
+            reference = ((admin or {}).get("permissions") or {}).get(key) or {}
+            validation_source = _REFERENCE_ROLE
+
+        unknown = sorted(set(permissions) - set(reference)) if reference else []
         if unknown:
             return {
                 "error": (
                     f"Unknown permission key(s) for {permission_type}: {', '.join(unknown)}. "
-                    f"{role}.{key} has: {', '.join(sorted(before))}. "
+                    f"{validation_source}.{key} has: {', '.join(sorted(reference))}. "
                     "LibreChat would accept this with a 200 and change nothing."
                 )
             }
