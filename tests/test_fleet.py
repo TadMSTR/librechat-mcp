@@ -517,3 +517,382 @@ async def test_get_effective_permissions_uses_the_all_route_without_an_agent(aut
         result = await srv.get_effective_permissions()
 
     assert result == {"permissions": {"MONGO_A": 15, "MONGO_B": 1}, "count": 2}
+
+
+# ---------------------------------------------------------------------------
+# Pagination — the defects the first live run found
+# ---------------------------------------------------------------------------
+
+
+async def test_pagination_sends_the_cursor_as_cursor_not_after(authed_client):
+    """The response names it `after`; the request parameter is `cursor`.
+
+    `v1.js:1663` destructures `const { category, search, limit, cursor, promoted } =
+    req.query`, so `after=` is an unknown parameter and is ignored — every page comes
+    back as page one, with `has_more: true` and the same `after`, forever. Measured
+    both ways on the live instance. This asserts the parameter name, because the whole
+    defect is one word.
+    """
+    with respx.mock(base_url=BASE_URL) as mock:
+        route = mock.get("/api/agents").mock(
+            side_effect=[
+                httpx.Response(
+                    200, json={"data": [{"id": "a1"}], "has_more": True, "after": "CUR1"}
+                ),
+                httpx.Response(
+                    200, json={"data": [{"id": "a2"}], "has_more": False, "after": None}
+                ),
+            ]
+        )
+        result = await srv.list_agents(limit=1)
+
+    assert result["count"] == 2, "both pages should be collected"
+    second = route.calls[1].request.url
+    assert "cursor=CUR1" in str(second)
+    assert "after=" not in str(second), "after= is silently ignored upstream"
+
+
+async def test_pagination_stops_when_the_cursor_does_not_advance(authed_client):
+    """The no-progress guard, which is what caught the parameter-name bug live.
+
+    A server that keeps answering `has_more: true` with the same page would otherwise
+    be bounded only by the page ceiling — 20 pointless requests before returning a
+    wrong answer. Stopping on "no new ids" turns that into one wasted request.
+    """
+    with respx.mock(base_url=BASE_URL) as mock:
+        mock.get("/api/agents").mock(
+            return_value=httpx.Response(
+                200, json={"data": [{"id": "a1"}], "has_more": True, "after": "STUCK"}
+            )
+        )
+        result = await srv.list_agents(limit=1)
+
+    assert result["count"] == 1, "the repeated agent must not be counted twice"
+
+
+async def test_pagination_reports_hitting_the_page_ceiling(authed_client):
+    """A cap that is not reported is a silent truncation wearing a bound's clothes."""
+    with respx.mock(base_url=BASE_URL) as mock:
+        pages = [
+            httpx.Response(
+                200,
+                json={"data": [{"id": f"a{i}"}], "has_more": True, "after": f"C{i}"},
+            )
+            for i in range(srv._MAX_AGENT_PAGES + 2)
+        ]
+        mock.get("/api/agents").mock(side_effect=pages)
+        result = await srv.list_agents(limit=1)
+
+    assert result["count"] == srv._MAX_AGENT_PAGES
+    assert result["truncated"] is True
+    assert "Narrow the search" in result["warning"]
+
+
+async def test_list_agents_expand_fetches_full_objects(authed_client):
+    """The listing is a projection with no `model`, so a diff against it is worthless."""
+    with respx.mock(base_url=BASE_URL) as mock:
+        mock.get("/api/agents").mock(
+            return_value=httpx.Response(200, json={"data": [{"id": "a1", "name": "One"}]})
+        )
+        mock.get("/api/agents/a1").mock(
+            return_value=httpx.Response(200, json={"id": "a1", "name": "One", "model": "m"})
+        )
+        result = await srv.list_agents(expand=True)
+
+    assert result["agents"][0]["model"] == "m"
+    assert result["expanded"] is True
+
+
+# ---------------------------------------------------------------------------
+# ensure_agent
+# ---------------------------------------------------------------------------
+
+
+async def test_ensure_agent_reports_unchanged_without_writing(authed_client):
+    """`unchanged` must mean "no write happened", not "we wrote and it matched".
+
+    LibreChat appends to `versions[]` on a real change and `revert_agent` walks that
+    list, so a reconciler that PATCHed unconditionally would bury every meaningful
+    revision under identical re-applications.
+    """
+    current = {
+        "id": "a1",
+        "name": "Fleet",
+        "provider": "Mistral",
+        "model": "m",
+        "instructions": "do things",
+    }
+    with respx.mock(base_url=BASE_URL, assert_all_called=False) as mock:
+        mock.get("/api/agents").mock(
+            return_value=httpx.Response(200, json={"data": [{"id": "a1", "name": "Fleet"}]})
+        )
+        mock.get("/api/agents/a1").mock(return_value=httpx.Response(200, json=current))
+        patch = mock.patch("/api/agents/a1")
+        post = mock.post("/api/agents")
+        result = await srv.ensure_agent(
+            name="Fleet",
+            spec={"provider": "Mistral", "model": "m", "instructions": "do things"},
+        )
+
+    assert result["action"] == "unchanged"
+    assert result["changed"] == []
+    assert not patch.called, "unchanged must issue NO write"
+    assert not post.called
+
+
+async def test_ensure_agent_updates_only_when_a_field_actually_differs(authed_client):
+    with respx.mock(base_url=BASE_URL) as mock:
+        mock.get("/api/agents").mock(
+            return_value=httpx.Response(200, json={"data": [{"id": "a1", "name": "Fleet"}]})
+        )
+        mock.get("/api/agents/a1").mock(
+            return_value=httpx.Response(
+                200, json={"id": "a1", "provider": "Mistral", "model": "m", "instructions": "old"}
+            )
+        )
+        patch = mock.patch("/api/agents/a1").mock(
+            return_value=httpx.Response(200, json={"id": "a1", "instructions": "new"})
+        )
+        result = await srv.ensure_agent(
+            name="Fleet", spec={"provider": "Mistral", "model": "m", "instructions": "new"}
+        )
+
+    assert result["action"] == "updated"
+    assert result["changed"] == ["instructions"]
+    assert json.loads(patch.calls[0].request.content) == {
+        "provider": "Mistral",
+        "model": "m",
+        "instructions": "new",
+    }
+
+
+async def test_ensure_agent_ignores_tool_ordering(authed_client):
+    """LibreChat returns MCP tool keys in its own resolved order.
+
+    A positional compare would report a difference on every run, so `unchanged` would
+    never be reachable and every reconciliation would grow `versions[]`.
+    """
+    with respx.mock(base_url=BASE_URL, assert_all_called=False) as mock:
+        mock.get("/api/agents").mock(
+            return_value=httpx.Response(200, json={"data": [{"id": "a1", "name": "Fleet"}]})
+        )
+        mock.get("/api/agents/a1").mock(
+            return_value=httpx.Response(
+                200,
+                json={
+                    "id": "a1",
+                    "provider": "Mistral",
+                    "model": "m",
+                    "tools": ["b_tool", "a_tool"],
+                },
+            )
+        )
+        patch = mock.patch("/api/agents/a1")
+        result = await srv.ensure_agent(
+            name="Fleet",
+            spec={"provider": "Mistral", "model": "m", "tools": ["a_tool", "b_tool"]},
+        )
+
+    assert result["action"] == "unchanged"
+    assert not patch.called
+
+
+async def test_ensure_agent_refuses_an_ambiguous_name(authed_client):
+    """Names are not unique server-side, so picking one silently could rewrite the wrong agent."""
+    with respx.mock(base_url=BASE_URL, assert_all_called=False) as mock:
+        mock.get("/api/agents").mock(
+            return_value=httpx.Response(
+                200,
+                json={"data": [{"id": "a1", "name": "Fleet"}, {"id": "a2", "name": "Fleet"}]},
+            )
+        )
+        patch = mock.patch("/api/agents/a1")
+        result = await srv.ensure_agent(name="Fleet", spec={"provider": "Mistral", "model": "m"})
+
+    assert "2 agents are named" in result["error"]
+    assert not patch.called
+
+
+async def test_ensure_agent_matches_the_name_exactly_not_fuzzily(authed_client):
+    """`?search=` is a fuzzy match upstream, so 'Research' also returns 'Research Assistant'.
+
+    Keying reconciliation off a near-match would rewrite a different agent than the
+    caller named.
+    """
+    with respx.mock(base_url=BASE_URL, assert_all_called=False) as mock:
+        mock.get("/api/agents").mock(
+            return_value=httpx.Response(
+                200,
+                json={
+                    "data": [
+                        {"id": "a1", "name": "Research Assistant"},
+                        {"id": "a2", "name": "Research"},
+                    ]
+                },
+            )
+        )
+        mock.get("/api/agents/a2").mock(
+            return_value=httpx.Response(200, json={"id": "a2", "provider": "Mistral", "model": "m"})
+        )
+        result = await srv.ensure_agent(name="Research", spec={"provider": "Mistral", "model": "m"})
+
+    assert result["agent_id"] == "a2"
+    assert result["action"] == "unchanged"
+
+
+async def test_ensure_agent_rejects_a_spec_field_that_is_silently_ignored(authed_client):
+    """`isPublic` in a spec would look applied and never be. Refuse it by name."""
+    result = await srv.ensure_agent(
+        name="Fleet", spec={"provider": "Mistral", "model": "m", "isPublic": True}
+    )
+    assert "isPublic" in result["error"]
+    assert "share_agent" in result["error"]
+
+
+async def test_ensure_agent_can_refuse_to_create(authed_client):
+    with respx.mock(base_url=BASE_URL, assert_all_called=False) as mock:
+        mock.get("/api/agents").mock(return_value=httpx.Response(200, json={"data": []}))
+        post = mock.post("/api/agents")
+        result = await srv.ensure_agent(
+            name="Absent", spec={"provider": "Mistral", "model": "m"}, create_missing=False
+        )
+
+    assert "create_missing is False" in result["error"]
+    assert not post.called
+
+
+# ---------------------------------------------------------------------------
+# Validation
+# ---------------------------------------------------------------------------
+
+
+async def test_list_models_intersects_with_the_enabled_endpoints(authed_client):
+    """`/api/models` alone would accept a model on a disabled provider.
+
+    Measured: it still lists `anthropic` and its models while `/api/endpoints`
+    returns only `['agents', 'Mistral']`. The failure would surface in chat, not at
+    call time.
+    """
+    with respx.mock(base_url=BASE_URL) as mock:
+        mock.get("/api/models").mock(
+            return_value=httpx.Response(
+                200, json={"Mistral": ["mistral-small-latest"], "anthropic": ["claude-x"]}
+            )
+        )
+        mock.get("/api/endpoints").mock(
+            return_value=httpx.Response(
+                200,
+                content=b'{"agents": {}, "Mistral": {}}',
+                # text/html with a JSON body, exactly as upstream sends it.
+                headers={"content-type": "text/html; charset=utf-8"},
+            )
+        )
+        result = await srv.list_models()
+
+    assert result["providers"] == ["Mistral"]
+    assert "anthropic" in result["excluded_providers"]
+
+
+async def test_endpoints_is_read_despite_its_wrong_content_type(authed_client):
+    """`GET /api/endpoints` answers `text/html` with a JSON body on v0.8.8-rc2.
+
+    The client refuses a mislabelled body by default — that strictness is what catches
+    LibreChat's 200-with-an-SSE-error. This asserts the narrow opt-in reaches the one
+    endpoint that needs it, so a regression shows up as an unreadable provider list
+    rather than as silently wrong validation.
+    """
+    from librechat_mcp.client import get_client
+
+    with respx.mock(base_url=BASE_URL) as mock:
+        mock.get("/api/endpoints").mock(
+            return_value=httpx.Response(
+                200,
+                content=b'{"Mistral": {}}',
+                headers={"content-type": "text/html; charset=utf-8"},
+            )
+        )
+        client = get_client()
+        strict = await _capture_error(client, "/api/endpoints")
+        assert "expected JSON" in strict, "the default must still refuse a mislabelled body"
+
+    with respx.mock(base_url=BASE_URL) as mock:
+        mock.get("/api/endpoints").mock(
+            return_value=httpx.Response(
+                200,
+                content=b'{"Mistral": {}}',
+                headers={"content-type": "text/html; charset=utf-8"},
+            )
+        )
+        assert await client.request("GET", "/api/endpoints", allow_mislabelled_json=True) == {
+            "Mistral": {}
+        }
+
+
+async def _capture_error(client, path):
+    try:
+        await client.request("GET", path)
+    except Exception as exc:  # the message IS the assertion
+        return str(exc)
+    return ""
+
+
+async def test_the_opt_in_still_refuses_an_sse_error_body(authed_client):
+    """The relaxation must not open the door the strictness was built to close.
+
+    `_decode_json` tests for SSE first and unconditionally, so LibreChat's
+    200-with-`Illegal request` is caught whether or not the caller opted in. Asserting
+    it here is what stops the flag quietly becoming a bypass.
+    """
+    from librechat_mcp.client import LibreChatError, get_client
+
+    with respx.mock(base_url=BASE_URL) as mock:
+        mock.get("/api/endpoints").mock(
+            return_value=httpx.Response(
+                200, content=b'event: error\ndata: {"message":"Illegal request"}\n\n'
+            )
+        )
+        with pytest.raises(LibreChatError, match="Illegal request"):
+            await get_client().request("GET", "/api/endpoints", allow_mislabelled_json=True)
+
+
+async def test_validate_agent_spec_names_the_closest_valid_value(authed_client):
+    with respx.mock(base_url=BASE_URL, assert_all_called=False) as mock:
+        mock.get("/api/models").mock(return_value=httpx.Response(200, json={"Mistral": ["m1"]}))
+        mock.get("/api/endpoints").mock(
+            return_value=httpx.Response(
+                200, content=b'{"Mistral": {}}', headers={"content-type": "text/html"}
+            )
+        )
+        result = await srv.validate_agent_spec(provider="Mistrl")
+
+    assert result["valid"] is False
+    assert "did you mean 'Mistral'" in result["errors"][0]
+
+
+async def test_validate_agent_spec_warns_rather_than_errors_on_a_toolless_registry(
+    authed_client,
+):
+    """A server that attaches fine but delivers nothing at chat time is a WARNING.
+
+    The catalogue and the runtime registry are different surfaces and disagree here:
+    a jobsearch tool attaches and LibreChat derives `mcpServerNames: ['jobsearch']`
+    (measured live), but its `toolFunctions` are empty. The spec is valid; the runtime
+    is broken. Reporting it as invalid would be wrong, and reporting nothing would
+    hand the caller an agent that silently does nothing.
+    """
+    with respx.mock(base_url=BASE_URL) as mock:
+        _mock_mcp_tools(mock)
+        mock.get("/api/mcp/servers").mock(
+            return_value=httpx.Response(
+                200,
+                json={
+                    "searxng": {"toolFunctions": {"search_mcp_searxng": {}}},
+                    "jobsearch": {},
+                },
+            )
+        )
+        result = await srv.validate_agent_spec(mcp_servers=["jobsearch", "searxng"])
+
+    assert result["valid"] is True
+    assert len(result["warnings"]) == 1
+    assert "jobsearch" in result["warnings"][0]

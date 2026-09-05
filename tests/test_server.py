@@ -192,14 +192,26 @@ async def test_list_agents_reports_truncation_instead_of_hiding_it(authed_client
     assert result["after"] == "cursor_xyz"
 
 
-async def test_list_agents_falls_back_to_last_id_when_after_is_absent(authed_client):
+async def test_list_agents_never_uses_last_id_as_a_cursor(authed_client):
+    """`last_id` is an agent id, not a cursor — the old fallback to it was wrong.
+
+    Measured on v0.8.8-rc2: passing `last_id` as the cursor re-returns the same page.
+    So a response reporting `has_more` with no `after` has no usable cursor, and
+    saying so is the honest answer. Falling back to `last_id` would have converted
+    "cannot page" into "silently loop on page one".
+    """
     with respx.mock(base_url=BASE_URL) as mock:
-        mock.get("/api/agents").mock(
+        route = mock.get("/api/agents").mock(
             return_value=httpx.Response(
                 200, json={"data": [AGENT], "has_more": True, "last_id": "z"}
             )
         )
-        assert (await srv.list_agents())["after"] == "z"
+        result = await srv.list_agents()
+
+    assert result["after"] is None
+    assert result["has_more"] is True
+    assert len(route.calls) == 1, "with no cursor there is nothing to follow — do not re-request"
+    assert "cursor" not in str(route.calls[0].request.url)
 
 
 async def test_list_agents_accepts_a_bare_list_response(authed_client):

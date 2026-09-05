@@ -316,14 +316,19 @@ async def test_the_registered_tools_still_carry_their_real_parameters():
     """
     tools = {t.name: t for t in await srv.mcp.list_tools()}
 
-    assert set(tools["list_agents"].parameters["properties"]) == {"search", "limit"}
-    assert set(tools["get_agent"].parameters["properties"]) == {"agent_id"}
-    # All six tools are wrapped, so an empty schema on any of them is the same bug.
+    assert set(tools["list_agents"].parameters["properties"]) == {
+        "search",
+        "limit",
+        "expand",
+        "follow_cursor",
+    }
+    assert set(tools["get_agent"].parameters["properties"]) == {"agent_id", "expanded"}
+    # Every tool is wrapped, so an empty schema on any of them is the same bug.
     assert not [
         name
         for name, tool in tools.items()
         if not tool.parameters.get("properties")
-        and name not in {"list_tools", "list_mcp_servers"}  # genuinely take no arguments
+        and name not in {"list_tools", "list_mcp_servers", "list_categories"}  # take no arguments
     ]
 
 

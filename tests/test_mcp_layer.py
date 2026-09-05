@@ -65,6 +65,16 @@ TOOL_ARGUMENTS: dict[str, dict] = {
         "permission_type": "agents",
         "permissions": {"SHARE": True},
     },
+    "ensure_agent": {
+        "name": "P4 Gate Agent",
+        "spec": {"provider": "Mistral", "model": "m"},
+    },
+    "duplicate_agent": {"agent_id": "agent_test"},
+    "list_agent_versions": {"agent_id": "agent_test"},
+    "revert_agent": {"agent_id": "agent_test", "version_index": 0},
+    "list_models": {},
+    "list_categories": {},
+    "validate_agent_spec": {"provider": "Mistral", "model": "mistral-small-latest"},
 }
 
 # The shapes that break a `-> dict` tool at FastMCP's boundary. The array is the one
