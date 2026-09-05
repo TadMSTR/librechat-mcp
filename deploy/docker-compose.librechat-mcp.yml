@@ -30,7 +30,12 @@ services:
     # which meant the deployed artefact moved whenever main moved, while the running
     # container did not, so what was deployed and what was running could silently
     # disagree.
-    image: ghcr.io/tadmstr/librechat-mcp:v0.2.0
+    #
+    # NOTE THE MISSING `v`. The git tag is `v0.2.0` but the IMAGE tag is `0.2.0`:
+    # docker-publish.yml uses `type=semver,pattern={{version}}`, which strips the
+    # prefix. `ghcr.io/tadmstr/librechat-mcp:v0.2.0` is a 404 — verified against the
+    # registry, after this file was first written with the wrong one.
+    image: ghcr.io/tadmstr/librechat-mcp:0.2.0
     container_name: librechat-mcp
     depends_on:
       - librechat

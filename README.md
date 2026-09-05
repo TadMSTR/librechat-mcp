@@ -106,10 +106,16 @@ MCP_PORT=8496 librechat-mcp
 
 ### Docker sidecar
 
-The server is designed to run as a sidecar alongside the LibreChat container, with access to the internal Docker network.
+The server runs as a sidecar alongside the LibreChat container, on the internal Docker
+network.
+
+**A full, hardened service block is in [`deploy/docker-compose.librechat-mcp.yml`](deploy/docker-compose.librechat-mcp.yml)** — use that
+rather than the snippet below if you are deploying for real. It carries `read_only`,
+`cap_drop`, `no-new-privileges`, resource limits, log rotation, and the reasoning for each.
 
 ```bash
-docker pull ghcr.io/tadmstr/librechat-mcp:latest
+# note: no `v` — the git tag is v0.2.0, the image tag is 0.2.0
+docker pull ghcr.io/tadmstr/librechat-mcp:0.2.0
 ```
 
 Minimal compose snippet:
@@ -117,16 +123,36 @@ Minimal compose snippet:
 ```yaml
 services:
   librechat-mcp:
-    image: ghcr.io/tadmstr/librechat-mcp:latest
+    # Pin the tag. `:latest` also exists, but it moves on every push to main while the
+    # running container does not — so what is deployed and what is running can disagree.
+    image: ghcr.io/tadmstr/librechat-mcp:0.2.0
     environment:
-      LIBRECHAT_URL: http://LibreChat:3080
+      # The service name on the shared network, NOT localhost — that is this
+      # container's own loopback, where nothing is listening.
+      LIBRECHAT_URL: http://librechat:3080
       LIBRECHAT_ADMIN_EMAIL: ${LIBRECHAT_ADMIN_EMAIL}
       LIBRECHAT_ADMIN_PASSWORD: ${LIBRECHAT_ADMIN_PASSWORD}
       MCP_PORT: "8496"
+      # MANDATORY from v0.2.0. The server refuses to start without it, so omitting
+      # this line does not give you an unauthenticated server — it gives you no
+      # server. Minimum 16 characters.
+      LIBRECHAT_MCP_API_TOKEN: ${LIBRECHAT_MCP_TOKEN}
     ports:
       - "127.0.0.1:8496:8496"
     restart: unless-stopped
 ```
+
+**Upgrading from v0.1.x is a paired change.** Add the token to your `.env` *before* pulling,
+or the container will fail to start:
+
+```bash
+# 1. add LIBRECHAT_MCP_TOKEN=<32+ hex chars> to the stack .env (mode 600)
+# 2. then, and only then:
+docker compose pull && docker compose up -d librechat-mcp
+```
+
+`docker compose restart` will **not** pick up a new image, and pushing to `main` republishes
+`:latest` without redeploying anything. A "fixed" service stays broken in that gap.
 
 ### PM2 (forge)
 
@@ -135,6 +161,7 @@ services:
   "name": "librechat-mcp",
   "script": "/path/to/.venv/bin/librechat-mcp",
   "env_file": "/path/to/librechat-mcp.env",
+  "//": "the env file must set LIBRECHAT_MCP_API_TOKEN — the process refuses to start without it",
   "restart_delay": 5000
 }
 ```
@@ -145,6 +172,9 @@ services:
 - name: librechat-mcp
   url: http://127.0.0.1:8496/mcp
   transport: streamable-http
+  headers:
+    # Required from v0.2.0 — without it every call returns 401.
+    Authorization: "Bearer ${LIBRECHAT_MCP_TOKEN}"
 ```
 
 ## Usage examples
