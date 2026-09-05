@@ -12,6 +12,7 @@ Tools:
 
 from __future__ import annotations
 
+import atexit
 import os
 import re
 from typing import Any
@@ -19,9 +20,16 @@ from typing import Any
 import structlog
 from fastmcp import FastMCP
 
+from . import __version__
 from .client import LibreChatConfigError, LibreChatError, get_client
+from .observability import configure_logging, get_tracer, instrument, shutdown_observability
 
-log = structlog.get_logger(__name__)
+# "librechat-mcp.server", not __name__. __name__ is "librechat_mcp.server" —
+# UNDERSCORE — which is not a child of the "librechat-mcp" logger that
+# configure_logging() attaches handlers to, so every line from this module would
+# propagate to root instead and be emitted by nothing. The dotted name puts it in
+# the app logger's hierarchy. tests/test_observability.py asserts it arrives.
+log = structlog.get_logger("librechat-mcp.server")
 
 _AGENT_ID_RE = re.compile(r"^[a-zA-Z0-9_-]+$")
 
@@ -95,6 +103,7 @@ def _tool_error(tool: str, err: Exception) -> dict:
 
 
 @mcp.tool
+@instrument("list_agents")
 async def list_agents(search: str = "", limit: int = 20) -> dict:
     """List LibreChat agents.
 
@@ -142,6 +151,7 @@ async def list_agents(search: str = "", limit: int = 20) -> dict:
 
 
 @mcp.tool
+@instrument("get_agent")
 async def get_agent(agent_id: str) -> dict:
     """Get a LibreChat agent by ID.
 
@@ -159,6 +169,7 @@ async def get_agent(agent_id: str) -> dict:
 
 
 @mcp.tool
+@instrument("create_agent")
 async def create_agent(
     provider: str,
     model: str,
@@ -204,6 +215,7 @@ async def create_agent(
 
 
 @mcp.tool
+@instrument("update_agent")
 async def update_agent(
     agent_id: str,
     provider: str | None = None,
@@ -259,6 +271,7 @@ async def update_agent(
 
 
 @mcp.tool
+@instrument("delete_agent")
 async def delete_agent(agent_id: str) -> dict:
     """Delete a LibreChat agent by ID.
 
@@ -277,6 +290,7 @@ async def delete_agent(agent_id: str) -> dict:
 
 
 @mcp.tool
+@instrument("list_tools")
 async def list_tools() -> dict:
     """List available LibreChat agent tools and capabilities.
 
@@ -296,9 +310,18 @@ async def list_tools() -> dict:
 
 
 def main() -> None:
+    configure_logging()
+    # Initialise OTEL up front rather than lazily on the first tool call, so a
+    # misconfigured endpoint warns at startup instead of on whatever call happens to
+    # be first. Returns None and stays silent when the env var is unset.
+    if get_tracer() is not None:
+        log.info("librechat_mcp_otel_enabled")
+    atexit.register(shutdown_observability)
+
     port = int(os.getenv("MCP_PORT", "8496"))
+    log.info("librechat_mcp_starting", port=port, version=__version__)
     mcp.run(transport="streamable-http", host="0.0.0.0", port=port)
 
 
-if __name__ == "__main__":
+if __name__ == "__main__":  # pragma: no cover
     main()

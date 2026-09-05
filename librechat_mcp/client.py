@@ -29,7 +29,9 @@ import structlog
 
 from . import __version__
 
-log = structlog.get_logger("librechat-mcp")
+# Dotted child of the "librechat-mcp" logger configure_logging() sets up, so
+# these records reach its handlers. See the note in server.py.
+log = structlog.get_logger("librechat-mcp.client")
 
 # LibreChat's uaParser middleware (api/server/middleware/uaParser.js) runs
 # ua-parser-js over the User-Agent and rejects the request with `Illegal request`

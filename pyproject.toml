@@ -6,16 +6,29 @@ build-backend = "setuptools.build_meta"
 name = "librechat-mcp"
 dynamic = ["version"]
 description = "FastMCP server for LibreChat agent management"
+license = "MIT"
 readme = "README.md"
 requires-python = ">=3.11"
 dependencies = [
-    "fastmcp>=2.0",
+    # Pinned to the 3.x major. `>=2.0` was open-ended, the container runs 3.4.4, and
+    # a fresh resolve today gives 4.0.3 — so because docker-publish.yml rebuilds
+    # `:latest` on every push to main, the merge that lands a fix would also ship an
+    # untested major. Widen this deliberately, with the suite run against the new
+    # major, rather than by leaving the door open.
+    "fastmcp>=3.2.0,<4.0.0",
     "httpx>=0.27",
-    "pydantic>=2.0",
     "structlog>=24.0",
 ]
 
 [project.optional-dependencies]
+# gRPC OTLP (port 4317), not HTTP (4318) — observability.py imports the grpc
+# exporter. CI installs ".[dev,otel]": with a [dev]-only install the OTEL tests
+# would skip themselves into a silent green, which is the failure this extra exists
+# to prevent (vikunja#336).
+otel = [
+    "opentelemetry-sdk>=1.20",
+    "opentelemetry-exporter-otlp-proto-grpc>=1.20",
+]
 dev = [
     "pytest>=8.0",
     "pytest-asyncio>=0.23",
@@ -44,7 +57,14 @@ testpaths = ["tests"]
 
 [tool.coverage.run]
 source = ["librechat_mcp"]
+# observability.py is deliberately INSIDE the gate. It is the file that decides
+# whether this server produces any log output at all, and it produced none for six
+# weeks — omitting it would leave that behaviour unmeasured exactly where it matters.
 omit = ["tests/*"]
+
+[tool.coverage.report]
+fail_under = 90
+show_missing = true
 
 [tool.ruff]
 line-length = 100
