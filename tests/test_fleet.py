@@ -896,3 +896,188 @@ async def test_validate_agent_spec_warns_rather_than_errors_on_a_toolless_regist
     assert result["valid"] is True
     assert len(result["warnings"]) == 1
     assert "jobsearch" in result["warnings"][0]
+
+
+# ---------------------------------------------------------------------------
+# Guard clauses — cheap to write, and each one is a wrong answer if it regresses
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    ("tool", "kwargs"),
+    [
+        ("get_agent_permissions", {"agent_id": "../etc/passwd"}),
+        ("share_agent", {"agent_id": "bad id", "grant": [{"type": "user", "id": "u"}]}),
+        ("get_effective_permissions", {"agent_id": "bad id"}),
+        ("duplicate_agent", {"agent_id": "../../x"}),
+        ("list_agent_versions", {"agent_id": "bad id"}),
+        ("revert_agent", {"agent_id": "bad id", "version_index": 0}),
+    ],
+)
+async def test_every_agent_id_taking_tool_validates_it(tool, kwargs, authed_client):
+    """The path guard must hold on the new tools too, not just the six it shipped for.
+
+    Each of these interpolates `agent_id` into a URL. A guard that covers most of the
+    surface is the kind of gap that only shows up once.
+    """
+    result = await getattr(srv, tool)(**kwargs)
+    assert "Invalid agent_id" in result["error"]
+
+
+@pytest.mark.parametrize(
+    ("tool", "kwargs", "expected"),
+    [
+        ("get_role_permissions", {"role": ""}, "role is required"),
+        (
+            "set_role_permissions",
+            {"role": "", "permission_type": "agents", "permissions": {"USE": True}},
+            "role is required",
+        ),
+        (
+            "set_role_permissions",
+            {"role": "USER", "permission_type": "agents", "permissions": {}},
+            "permissions is required",
+        ),
+        (
+            "set_role_permissions",
+            {"role": "USER", "permission_type": "nonsense", "permissions": {"USE": True}},
+            "Unsupported permission_type",
+        ),
+        ("search_principals", {"query": ""}, "query is required"),
+        ("ensure_agent", {"name": "", "spec": {}}, "name is required"),
+        ("ensure_agent", {"name": "x", "spec": "not-a-dict"}, "spec must be an object"),
+        (
+            "revert_agent",
+            {"agent_id": "agent_x", "version_index": -1},
+            "version_index must be >= 0",
+        ),
+        (
+            "revert_agent",
+            {"agent_id": "agent_x", "version_index": True},
+            "must be an integer",
+        ),
+    ],
+)
+async def test_argument_guards_refuse_before_any_request(tool, kwargs, expected, authed_client):
+    """`version_index=True` matters: bool is an int subclass, so a naive check passes it.
+
+    Every case here returns before a request is issued, so respx has nothing mocked —
+    a guard that regressed would attempt a real connection and fail loudly.
+    """
+    result = await getattr(srv, tool)(**kwargs)
+    assert expected in result["error"]
+
+
+async def test_list_mcp_tools_can_be_narrowed_to_one_server(authed_client):
+    with respx.mock(base_url=BASE_URL) as mock:
+        _mock_mcp_tools(mock)
+        result = await srv.list_mcp_tools(server="jobsearch")
+
+    assert set(result["servers"]) == {"jobsearch"}
+    assert result["count"] == 1
+
+
+async def test_validate_agent_spec_checks_tools_and_categories(authed_client):
+    """Covers the tools and category branches, and the MCP-key acceptance path.
+
+    An MCP pluginKey must validate against `/api/mcp/tools`, not `/api/agents/tools` —
+    otherwise every valid MCP key is reported as invalid.
+    """
+    with respx.mock(base_url=BASE_URL) as mock:
+        _mock_mcp_tools(mock)
+        mock.get("/api/agents/tools").mock(
+            return_value=httpx.Response(200, json=[{"pluginKey": "calculator"}])
+        )
+        mock.get("/api/agents/categories").mock(
+            return_value=httpx.Response(200, json=[{"value": "general"}])
+        )
+        result = await srv.validate_agent_spec(
+            tools=["calculator", "search_mcp_searxng", "nope"], category="generl"
+        )
+
+    assert result["valid"] is False
+    assert len(result["errors"]) == 2, "the two valid keys must pass, including the MCP one"
+    assert any("did you mean 'general'" in e for e in result["errors"])
+    assert set(result["checked"]) == {"tools", "category"}
+
+
+async def test_validate_agent_spec_rejects_a_model_the_provider_does_not_offer(authed_client):
+    with respx.mock(base_url=BASE_URL) as mock:
+        mock.get("/api/models").mock(
+            return_value=httpx.Response(200, json={"Mistral": ["mistral-small-latest"]})
+        )
+        mock.get("/api/endpoints").mock(
+            return_value=httpx.Response(
+                200, content=b'{"Mistral": {}}', headers={"content-type": "text/html"}
+            )
+        )
+        result = await srv.validate_agent_spec(provider="Mistral", model="mistral-small-lates")
+
+    assert "did you mean 'mistral-small-latest'" in result["errors"][0]
+
+
+async def test_ensure_agent_refuses_an_unknown_mcp_server_before_listing(authed_client):
+    with respx.mock(base_url=BASE_URL, assert_all_called=False) as mock:
+        _mock_mcp_tools(mock)
+        listing = mock.get("/api/agents")
+        result = await srv.ensure_agent(
+            name="Fleet", spec={"provider": "Mistral", "model": "m"}, mcp_servers=["nope"]
+        )
+
+    assert "nope" in result["error"]
+    assert not listing.called
+
+
+async def test_ensure_agent_creates_with_the_mcp_expansion(authed_client):
+    with respx.mock(base_url=BASE_URL) as mock:
+        _mock_mcp_tools(mock)
+        mock.get("/api/agents").mock(return_value=httpx.Response(200, json={"data": []}))
+        route = mock.post("/api/agents").mock(
+            return_value=httpx.Response(
+                201,
+                json={
+                    "id": "a1",
+                    "tools": ["search_mcp_searxng", "fetch_url_mcp_searxng"],
+                    "mcpServerNames": ["searxng"],
+                },
+            )
+        )
+        result = await srv.ensure_agent(
+            name="Fleet", spec={"provider": "Mistral", "model": "m"}, mcp_servers=["searxng"]
+        )
+
+    assert result["action"] == "created"
+    assert json.loads(route.calls[0].request.content)["name"] == "Fleet"
+    assert result["agent"]["mcpServerNames"] == ["searxng"]
+
+
+async def test_ensure_agent_detects_a_changed_mcp_attachment(authed_client):
+    """`mcpServerNames` is the field that says whether the attachment took.
+
+    Comparing only `tools` would miss a server whose own tool set changed upstream
+    between two runs of the same spec.
+    """
+    with respx.mock(base_url=BASE_URL) as mock:
+        _mock_mcp_tools(mock)
+        mock.get("/api/agents").mock(
+            return_value=httpx.Response(200, json={"data": [{"id": "a1", "name": "Fleet"}]})
+        )
+        mock.get("/api/agents/a1").mock(
+            return_value=httpx.Response(
+                200,
+                json={
+                    "id": "a1",
+                    "provider": "Mistral",
+                    "model": "m",
+                    "tools": ["search_mcp_searxng", "fetch_url_mcp_searxng"],
+                    "mcpServerNames": [],
+                },
+            )
+        )
+        mock.patch("/api/agents/a1").mock(return_value=httpx.Response(200, json={"id": "a1"}))
+        result = await srv.ensure_agent(
+            name="Fleet", spec={"provider": "Mistral", "model": "m"}, mcp_servers=["searxng"]
+        )
+
+    assert result["action"] == "updated"
+    assert "tools" in result["changed"]

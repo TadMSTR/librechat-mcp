@@ -143,3 +143,27 @@ async def test_no_tool_raises_through_the_mcp_layer_when_upstream_fails(tool_nam
             )
     assert not result.is_error, f"{tool_name} raised instead of returning an error dict"
     assert "error" in result.data, f"{tool_name} returned {result.data!r}, expected an error dict"
+
+
+async def test_the_readme_tool_table_matches_what_is_registered():
+    """The README documents each tool by name; drift there is drift in the contract.
+
+    This repo has already shipped docs that described a tag which 404s and a wiring
+    block that could not start the container. A table naming tools that do not exist —
+    or omitting ones that do — is the same defect in a cheaper place to catch it.
+    """
+    import pathlib
+    import re
+
+    readme = (pathlib.Path(__file__).resolve().parent.parent / "README.md").read_text()
+    table_section = readme.split("### Every tool returns a dict")[0]
+    documented = set(re.findall(r"^\| `(\w+)` \|", table_section, re.MULTILINE))
+    registered = await _registered_tool_names()
+
+    assert documented == registered, (
+        f"README missing: {sorted(registered - documented)}; "
+        f"README lists unregistered: {sorted(documented - registered)}"
+    )
+    assert f"{len(registered)} tools in three groups" in readme, (
+        "the README's headline count disagrees with the registration"
+    )
