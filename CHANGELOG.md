@@ -9,6 +9,20 @@ Verified against **LibreChat `v0.8.8-rc2`** (image
 `ghcr.io/danny-avila/librechat:v0.8.8-rc2`), every tool exercised through the MCP layer
 against that running instance rather than by calling the Python functions.
 
+### Security
+
+- **`role` is validated before it reaches a URL path.** It is interpolated into
+  `/api/roles/{role}` and `/api/roles/{role}/{permission_type}`, and httpx normalises
+  `..` segments before sending, so an unvalidated value left the namespace entirely:
+  `role="../agents/agent_victim"` became `GET /api/agents/agent_victim`. Found by the
+  pre-audit baseline (IV-15). `agent_id` has carried this guard since v0.2.0.
+- **`set_role_permissions` key validation no longer disables itself on an empty block.**
+  The guard read `... if before else []`, so a role with no existing block for that
+  permission type short-circuited the check to "nothing unknown" and posted the typo'd
+  key anyway. Found by the part 4 security audit. It now falls back to a role that does
+  carry the block, and where none does it proceeds rather than failing closed — a
+  permission type LibreChat adds in a later release has no block anywhere until seeded.
+
 ### Fixed
 
 - **`list_tools` was 100% dead through MCP and is now the convention.** It was annotated
