@@ -37,6 +37,9 @@ from .observability import configure_logging, get_tracer, instrument, shutdown_o
 log = structlog.get_logger("librechat-mcp.server")
 
 _AGENT_ID_RE = re.compile(r"^[a-zA-Z0-9_-]+$")
+# Same class, separate constant: these guard different parameters on different
+# routes, and collapsing them would make loosening one silently loosen the other.
+_ROLE_NAME_RE = re.compile(r"^[a-zA-Z0-9_-]+$")
 
 # `Constants.mcp_delimiter` in LibreChat's data-provider package. An MCP tool's
 # pluginKey is `${toolName}_mcp_${serverName}`, and it is that suffix — nothing in the
@@ -112,6 +115,30 @@ def _validate_agent_id(agent_id: str) -> str | None:
     """Return None if valid, error string if invalid."""
     if not agent_id or not _AGENT_ID_RE.match(agent_id):
         return "Invalid agent_id: must match ^[a-zA-Z0-9_-]+$"
+    return None
+
+
+def _validate_role(role: str) -> str | None:
+    """Return None if valid, error string if invalid.
+
+    **A path-traversal guard, not a typo check.** `role` is interpolated into
+    `/api/roles/{role}` and `/api/roles/{role}/{permission_type}`, and httpx
+    normalises `..` segments before the request is sent, so an unvalidated value
+    leaves the namespace entirely. Measured:
+
+        role="../agents/agent_victim"  ->  GET /api/agents/agent_victim
+        role="USER/../../agents"       ->  GET /api/agents
+
+    That turns `get_role_permissions` — a read tool, and one of the three on
+    research's scoped-mcp allowlist — into "GET any path on LibreChat", which defeats
+    the point of scoping the allowlist. `agent_id` has carried this guard since
+    v0.2.0; the role parameters arrived without it and this closes the gap.
+
+    `permission_type` and `resource_type` need no equivalent: both are checked against
+    closed vocabularies before use, which is strictly stronger than a character class.
+    """
+    if not role or not _ROLE_NAME_RE.match(role):
+        return "Invalid role: must match ^[a-zA-Z0-9_-]+$"
     return None
 
 
@@ -1243,8 +1270,8 @@ async def get_role_permissions(role: str) -> dict:
     Args:
         role: Role name, e.g. 'USER' or 'ADMIN'. Case-sensitive.
     """
-    if not role:
-        return {"error": "role is required"}
+    if err := _validate_role(role):
+        return {"error": err}
     try:
         client = get_client()  # inside the try — see _CLIENT_INSIDE_TRY
         data = await client.request("GET", f"/api/roles/{role}")
@@ -1287,8 +1314,8 @@ async def set_role_permissions(role: str, permission_type: str, permissions: dic
         permissions: Partial permission object, e.g. {"SHARE": true}. Merged
             server-side into the role's current values.
     """
-    if not role:
-        return {"error": "role is required"}
+    if err := _validate_role(role):
+        return {"error": err}
     if permission_type not in _ROLE_PERMISSION_TYPES:
         upper = permission_type.replace("-", "_").upper()
         if upper in _READ_ONLY_ROLE_PERMISSIONS:

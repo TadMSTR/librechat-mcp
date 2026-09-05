@@ -927,11 +927,11 @@ async def test_every_agent_id_taking_tool_validates_it(tool, kwargs, authed_clie
 @pytest.mark.parametrize(
     ("tool", "kwargs", "expected"),
     [
-        ("get_role_permissions", {"role": ""}, "role is required"),
+        ("get_role_permissions", {"role": ""}, "Invalid role"),
         (
             "set_role_permissions",
             {"role": "", "permission_type": "agents", "permissions": {"USE": True}},
-            "role is required",
+            "Invalid role",
         ),
         (
             "set_role_permissions",
@@ -1081,3 +1081,38 @@ async def test_ensure_agent_detects_a_changed_mcp_attachment(authed_client):
 
     assert result["action"] == "updated"
     assert "tools" in result["changed"]
+
+
+@pytest.mark.parametrize(
+    "role",
+    [
+        "../agents/agent_victim",
+        "USER/../../agents",
+        "..%2f..%2fapi%2fagents",
+        "USER/extra",
+        "USER ",
+    ],
+)
+async def test_role_cannot_traverse_out_of_the_roles_namespace(role, authed_client):
+    """`role` reaches a URL path, and httpx normalises `..` before sending.
+
+    Measured before the guard landed:
+
+        role="../agents/agent_victim"  ->  GET /api/agents/agent_victim
+        role="USER/../../agents"       ->  GET /api/agents
+
+    So an unvalidated `role` turns `get_role_permissions` into "GET any path on
+    LibreChat" — and that tool is one of the three on research's scoped-mcp allowlist,
+    so the traversal would reach straight past the scoping the allowlist exists to
+    provide. Both role-taking tools are checked, because a guard on one of two call
+    sites is the gap, not the fix.
+
+    respx has nothing mocked here on purpose: a regression would attempt a real
+    connection and fail loudly rather than quietly matching a route.
+    """
+    for tool, extra in (
+        ("get_role_permissions", {}),
+        ("set_role_permissions", {"permission_type": "agents", "permissions": {"USE": True}}),
+    ):
+        result = await getattr(srv, tool)(role=role, **extra)
+        assert "Invalid role" in result["error"], f"{tool} accepted {role!r}"
