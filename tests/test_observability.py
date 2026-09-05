@@ -323,7 +323,7 @@ async def test_the_registered_tools_still_carry_their_real_parameters():
         name
         for name, tool in tools.items()
         if not tool.parameters.get("properties")
-        and name not in {"list_tools"}  # genuinely takes no arguments
+        and name not in {"list_tools", "list_mcp_servers"}  # genuinely take no arguments
     ]
 
 

@@ -49,6 +49,8 @@ TOOL_ARGUMENTS: dict[str, dict] = {
     "update_agent": {"agent_id": "agent_test", "name": "x"},
     "delete_agent": {"agent_id": "agent_test"},
     "list_tools": {},
+    "list_mcp_tools": {},
+    "list_mcp_servers": {},
 }
 
 # The shapes that break a `-> dict` tool at FastMCP's boundary. The array is the one

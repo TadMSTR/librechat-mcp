@@ -38,6 +38,57 @@ log = structlog.get_logger("librechat-mcp.server")
 
 _AGENT_ID_RE = re.compile(r"^[a-zA-Z0-9_-]+$")
 
+# `Constants.mcp_delimiter` in LibreChat's data-provider package. An MCP tool's
+# pluginKey is `${toolName}_mcp_${serverName}`, and it is that suffix — nothing in the
+# request body — that makes LibreChat treat a tool as belonging to an MCP server.
+_MCP_DELIMITER = "_mcp_"
+
+# Fields LibreChat's agent API ACCEPTS on create/update, read from `agentCreateSchema`
+# in the running container's `packages/api/dist/index.d.cts` on v0.8.8-rc2 and then
+# round-tripped one by one against the live instance.
+#
+# **The Mongoose schema is a superset and is not the contract.** `agentCreateSchema`
+# and `agentUpdateSchema` are zod schemas in `'strip'` mode, so a key they do not
+# declare is dropped SILENTLY and the request still returns 200/201. A field can exist
+# in `agent.ts`, store fine in Mongo, and be unsettable over the API.
+#
+# Measured as silently dropped, and therefore deliberately NOT exposed as parameters:
+#   isPublic, is_promoted, access_level — posting them returns 201 and changes nothing.
+#     Sharing is done through the ACL surface (`share_agent`), which is the layer that
+#     actually works.
+#   tool_kwargs — present on the live agent object, absent from the zod schema.
+#   mcpServerNames — see `_expand_mcp_servers`; it is DERIVED from `tools`, not set.
+_AGENT_WRITABLE_FIELDS = (
+    "name",
+    "description",
+    "instructions",
+    "provider",
+    "model",
+    "model_parameters",
+    "tools",
+    "conversation_starters",
+    "category",
+    "memory_scope",
+    "artifacts",
+    "avatar",
+    "recursion_limit",
+    "end_after_tools",
+    "hide_sequential_outputs",
+    "support_contact",
+    "agent_ids",
+    "edges",
+    "subagents",
+    "skills",
+    "skills_enabled",
+    "skills_scope",
+    "skill_authoring_enabled",
+    "tool_options",
+    "tool_resources",
+    "code_environment_id",
+    "stateful_code_environment",
+    "stateful_code_sessions",
+)
+
 # HTTP transport is this server's only transport, and the tools behind it are full
 # agent CRUD — create, update and delete, against the instance the whole fleet is
 # built on. Until v0.2.0 there was no authentication at all: an unauthenticated
@@ -116,6 +167,75 @@ def _as_dict(data: Any, *, plural: str) -> dict:
     if isinstance(data, list):
         return {plural: data, "count": len(data)}
     return {plural: [data], "count": 1}
+
+
+async def _mcp_server_tools(client: Any) -> dict[str, list[str]]:
+    """Map MCP server name -> its tool pluginKeys, from `GET /api/mcp/tools`.
+
+    NOT from `GET /api/agents/tools`, which lists only LibreChat's 13 built-in tools
+    and no MCP tool at all — measured on v0.8.8-rc2. Validating an MCP tool key
+    against that endpoint would reject every valid one.
+    """
+    data = await client.request("GET", "/api/mcp/tools")
+    # `isinstance` rather than `(data or {})`: a truthy non-dict — the bare array this
+    # API hands back elsewhere — would reach `.get` and raise AttributeError, which
+    # then surfaces as an unexpected-error traceback instead of a usable message.
+    servers = data.get("servers") if isinstance(data, dict) else None
+    if not isinstance(servers, dict):
+        return {}
+    return {
+        name: [t["pluginKey"] for t in (spec.get("tools") or []) if t.get("pluginKey")]
+        for name, spec in servers.items()
+        if isinstance(spec, dict)
+    }
+
+
+async def _expand_mcp_servers(client: Any, servers: list[str]) -> tuple[list[str], list[str]]:
+    """Expand MCP server names into the tool pluginKeys that attach them to an agent.
+
+    **`mcpServerNames` cannot be set, and this is why the tool takes `mcp_servers`
+    instead.** It is absent from `agentCreateSchema`/`agentUpdateSchema` and is
+    DERIVED server-side in `api/server/controllers/agents/v1.js` (create :880,
+    update :1304) from whichever entries of `tools` carry the `_mcp_` delimiter.
+    Measured on v0.8.8-rc2:
+
+        posted tools=['search_mcp_searxng'], no mcpServerNames -> mcpServerNames=['searxng']
+        posted mcpServerNames=['searxng'], no MCP tools        -> mcpServerNames=[]
+
+    So the honest interface is "name the servers you want" — expanded here into the
+    tool keys LibreChat actually reads. Returns `(tool_keys, unknown_servers)`; the
+    caller reports the unknown ones rather than posting keys that would be dropped.
+    """
+    available = await _mcp_server_tools(client)
+    keys: list[str] = []
+    unknown: list[str] = []
+    for name in servers:
+        if name in available:
+            keys.extend(available[name])
+        else:
+            unknown.append(name)
+    return keys, unknown
+
+
+def _dropped_tools(requested: list[str] | None, returned: Any) -> list[str]:
+    """Tools that were asked for and did not survive the write.
+
+    **LibreChat drops an unknown or unauthorized tool silently on a 201.** Measured:
+    posting `tools=['search_mcp_nosuchserver']` returns 201 with `tools: []` and no
+    error anywhere in the response. `filterAuthorizedTools` removes it and the request
+    still succeeds.
+
+    That is this stack's house failure mode — a success-shaped signal — and it is
+    exactly what a caller provisioning a fleet must not miss, because the agent is
+    then created without the capability it was created for. Surfacing the difference
+    turns a silent drop into a visible one.
+    """
+    if not requested or not isinstance(returned, dict):
+        return []
+    kept = returned.get("tools")
+    if not isinstance(kept, list):
+        return []
+    return [t for t in requested if t not in kept]
 
 
 def _tool_error(tool: str, err: Exception) -> dict:
@@ -228,39 +348,154 @@ async def create_agent(
     description: str | None = None,
     instructions: str | None = None,
     tools: list[str] | None = None,
+    mcp_servers: list[str] | None = None,
     conversation_starters: list[str] | None = None,
     model_parameters: dict | None = None,
+    category: str | None = None,
+    memory_scope: str | None = None,
+    artifacts: str | None = None,
+    avatar: dict | None = None,
+    recursion_limit: int | None = None,
+    end_after_tools: bool | None = None,
+    hide_sequential_outputs: bool | None = None,
+    support_contact: dict | None = None,
+    agent_ids: list[str] | None = None,
+    edges: list[dict] | None = None,
+    subagents: list[dict] | None = None,
+    skills: list[str] | None = None,
+    skills_enabled: bool | None = None,
+    skills_scope: str | None = None,
+    skill_authoring_enabled: bool | None = None,
+    tool_options: dict | None = None,
+    tool_resources: dict | None = None,
+    code_environment_id: str | None = None,
+    stateful_code_environment: str | None = None,
+    stateful_code_sessions: bool | None = None,
 ) -> dict:
     """Create a new LibreChat agent.
 
+    Returns the created agent. When tools were requested and LibreChat kept only some
+    of them, the result also carries `dropped_tools` and `warning` — see below, and do
+    not ignore them: a drop is reported on a **201**.
+
     Args:
-        provider: LLM provider (e.g. 'anthropic').
-        model: Model name (e.g. 'claude-sonnet-4-6').
-        name: Display name for the agent.
+        provider: Endpoint name. For a custom endpoint this is the endpoint's `name:`
+            from librechat.yaml verbatim and case-sensitive — on forge, `Mistral`.
+        model: Model id, e.g. 'mistral-small-latest'. Validate with list_models.
+        name: Display name. Not unique server-side; two agents may share one.
         description: Short description shown in the UI.
-        instructions: System prompt / instructions for the agent.
-        tools: List of tool capabilities (e.g. ['web_search', 'artifacts']).
+        instructions: System prompt.
+        tools: Tool pluginKeys — `pluginKey`, not the display `name`. Use list_tools
+            for built-ins. **Unknown or unauthorized keys are dropped silently on a
+            201**, so check `dropped_tools` in the result.
+        mcp_servers: MCP server names to attach, e.g. ['searxng']. Expanded here into
+            that server's tool pluginKeys and appended to `tools`, because
+            **`mcpServerNames` is derived by LibreChat from `tools` and cannot be
+            set directly** — posting it is silently ignored. Discover names with
+            list_mcp_servers.
         conversation_starters: Suggested starter messages shown in the UI.
-        model_parameters: Model-specific parameters (temperature, max_tokens, etc.).
+        model_parameters: Model parameters (temperature, max_tokens, …).
+        category: Agent-picker grouping. Valid values from list_categories.
+        memory_scope: **'agent' or 'user'** — NOT a boolean. 'agent' is the Agent
+            Builder's "Keep memories separate for this agent"; omitted means the
+            shared pool. This is per-agent memory isolation, new in v0.8.8.
+        artifacts: Per-agent artifact behaviour, e.g. 'default'.
+        avatar: Avatar object, `{filepath, source}`.
+        recursion_limit: Bounds a delegating agent's recursion.
+        end_after_tools: Stop the turn after tool execution.
+        hide_sequential_outputs: Hide intermediate outputs of sequential tools.
+        support_contact: `{name, email}`. The email is validated server-side — a
+            malformed address is a 400, not a silent drop.
+        agent_ids: **Deprecated upstream — use `edges`.** Kept for compatibility.
+        edges: Delegation graph entries,
+            `{from, to, description?, edgeType?: 'handoff'|'direct', prompt?,
+            excludeResults?, promptKey?}`.
+        subagents: Subagent members. Capped by `endpoints.agents.maxSubagents`
+            (default 10), with server-side topology validation.
+        skills: Agent Skills entries.
+        skills_enabled: Enable Agent Skills for this agent.
+        skills_scope: **'all', 'selected' or 'none'** — do not confuse with
+            `memory_scope`, whose values are different.
+        skill_authoring_enabled: Allow this agent to author skills.
+        tool_options: `tool_id -> {defer_loading?, allowed_callers?,
+            run_in_background?, describe_intent?}`.
+        tool_resources: Only `image_edit`, `execute_code`, `file_search`, `context`
+            and `ocr` (deprecated) are accepted.
+        code_environment_id: Bind the agent to a code environment.
+        stateful_code_environment: 'user', 'agent-user' or 'conversation'.
+        stateful_code_sessions: Persist code sessions across turns.
+
+    Not exposed, because LibreChat accepts them and silently ignores them (measured —
+    each returns 201 and changes nothing): `isPublic`, `is_promoted`, `access_level`,
+    `tool_kwargs`. Share an agent with `share_agent`, which uses the ACL surface that
+    actually works.
     """
     try:
         client = get_client()  # inside the try — see _CLIENT_INSIDE_TRY
         body: dict[str, Any] = {"provider": provider, "model": model}
-        if name is not None:
-            body["name"] = name
-        if description is not None:
-            body["description"] = description
-        if instructions is not None:
-            body["instructions"] = instructions
-        if tools:
-            body["tools"] = tools
-        if conversation_starters:
-            body["conversation_starters"] = conversation_starters
-        if model_parameters:
-            body["model_parameters"] = model_parameters
+        supplied = {
+            "name": name,
+            "description": description,
+            "instructions": instructions,
+            "tools": tools,
+            "conversation_starters": conversation_starters,
+            "model_parameters": model_parameters,
+            "category": category,
+            "memory_scope": memory_scope,
+            "artifacts": artifacts,
+            "avatar": avatar,
+            "recursion_limit": recursion_limit,
+            "end_after_tools": end_after_tools,
+            "hide_sequential_outputs": hide_sequential_outputs,
+            "support_contact": support_contact,
+            "agent_ids": agent_ids,
+            "edges": edges,
+            "subagents": subagents,
+            "skills": skills,
+            "skills_enabled": skills_enabled,
+            "skills_scope": skills_scope,
+            "skill_authoring_enabled": skill_authoring_enabled,
+            "tool_options": tool_options,
+            "tool_resources": tool_resources,
+            "code_environment_id": code_environment_id,
+            "stateful_code_environment": stateful_code_environment,
+            "stateful_code_sessions": stateful_code_sessions,
+        }
+        body.update({k: v for k, v in supplied.items() if v is not None})
+
+        unknown_servers: list[str] = []
+        if mcp_servers:
+            mcp_keys, unknown_servers = await _expand_mcp_servers(client, mcp_servers)
+            if unknown_servers:
+                return {
+                    "error": (
+                        f"Unknown MCP server(s): {', '.join(unknown_servers)}. "
+                        "Use list_mcp_servers to see what LibreChat has enumerated."
+                    )
+                }
+            body["tools"] = [*(body.get("tools") or []), *mcp_keys]
+
+        requested_tools = body.get("tools")
         data = await client.request("POST", "/api/agents", json=body)
-        log.info("create_agent", name=name, provider=provider, model=model)
-        return _as_dict(data, plural="agents")
+        result = _as_dict(data, plural="agents")
+        dropped = _dropped_tools(requested_tools, result)
+        if dropped:
+            result["dropped_tools"] = dropped
+            result["warning"] = (
+                f"LibreChat silently dropped {len(dropped)} requested tool(s) on a "
+                "successful create — they are unknown or not authorised for this "
+                "account. The agent exists but lacks those capabilities."
+            )
+        log.info(
+            "create_agent",
+            name=name,
+            provider=provider,
+            model=model,
+            fields=sorted(body.keys()),
+            mcp_servers=mcp_servers or None,
+            dropped_tools=dropped or None,
+        )
+        return result
     except Exception as e:
         return _tool_error("create_agent", e)
 
@@ -275,48 +510,118 @@ async def update_agent(
     description: str | None = None,
     instructions: str | None = None,
     tools: list[str] | None = None,
+    mcp_servers: list[str] | None = None,
     conversation_starters: list[str] | None = None,
     model_parameters: dict | None = None,
+    category: str | None = None,
+    memory_scope: str | None = None,
+    artifacts: str | None = None,
+    avatar: dict | None = None,
+    recursion_limit: int | None = None,
+    end_after_tools: bool | None = None,
+    hide_sequential_outputs: bool | None = None,
+    support_contact: dict | None = None,
+    agent_ids: list[str] | None = None,
+    edges: list[dict] | None = None,
+    subagents: list[dict] | None = None,
+    skills: list[str] | None = None,
+    skills_enabled: bool | None = None,
+    skills_scope: str | None = None,
+    skill_authoring_enabled: bool | None = None,
+    tool_options: dict | None = None,
+    tool_resources: dict | None = None,
+    code_environment_id: str | None = None,
+    stateful_code_environment: str | None = None,
+    stateful_code_sessions: bool | None = None,
 ) -> dict:
-    """Update a LibreChat agent (partial update — only include fields to change).
+    """Partially update a LibreChat agent — only supplied fields are sent.
+
+    **List and dict fields REPLACE, they do not merge.** `tools=['calculator']` on an
+    agent that had three tools leaves it with one. To add a tool, read the current
+    list with get_agent and post the union.
+
+    A no-op update is safe: LibreChat compares against the current state and does not
+    append to `versions[]` when nothing changed (measured on v0.8.8-rc2), so
+    reconciliation does not pollute the revert history.
 
     Args:
         agent_id: Agent ID from list_agents or create_agent.
-        provider: LLM provider.
-        model: Model name.
-        name: Display name.
-        description: Short description.
-        instructions: System prompt.
-        tools: List of tool capabilities (replaces existing list).
-        conversation_starters: Suggested starter messages (replaces existing list).
-        model_parameters: Model-specific parameters (replaces existing dict).
+
+    All other arguments are as documented on create_agent, including the
+    `mcp_servers` note — `mcpServerNames` is derived from `tools` on update too and
+    cannot be set directly. Passing `mcp_servers` REPLACES the agent's tool list with
+    the expansion (plus any `tools` given alongside), which is how detaching a server
+    works: omit it and its tools go, and LibreChat revokes the agent-scoped access.
     """
     if err := _validate_agent_id(agent_id):
         return {"error": err}
     try:
         client = get_client()  # inside the try — see _CLIENT_INSIDE_TRY
-        body: dict[str, Any] = {}
-        if provider is not None:
-            body["provider"] = provider
-        if model is not None:
-            body["model"] = model
-        if name is not None:
-            body["name"] = name
-        if description is not None:
-            body["description"] = description
-        if instructions is not None:
-            body["instructions"] = instructions
-        if tools is not None:
-            body["tools"] = tools
-        if conversation_starters is not None:
-            body["conversation_starters"] = conversation_starters
-        if model_parameters is not None:
-            body["model_parameters"] = model_parameters
+        supplied = {
+            "provider": provider,
+            "model": model,
+            "name": name,
+            "description": description,
+            "instructions": instructions,
+            "tools": tools,
+            "conversation_starters": conversation_starters,
+            "model_parameters": model_parameters,
+            "category": category,
+            "memory_scope": memory_scope,
+            "artifacts": artifacts,
+            "avatar": avatar,
+            "recursion_limit": recursion_limit,
+            "end_after_tools": end_after_tools,
+            "hide_sequential_outputs": hide_sequential_outputs,
+            "support_contact": support_contact,
+            "agent_ids": agent_ids,
+            "edges": edges,
+            "subagents": subagents,
+            "skills": skills,
+            "skills_enabled": skills_enabled,
+            "skills_scope": skills_scope,
+            "skill_authoring_enabled": skill_authoring_enabled,
+            "tool_options": tool_options,
+            "tool_resources": tool_resources,
+            "code_environment_id": code_environment_id,
+            "stateful_code_environment": stateful_code_environment,
+            "stateful_code_sessions": stateful_code_sessions,
+        }
+        body: dict[str, Any] = {k: v for k, v in supplied.items() if v is not None}
+
+        if mcp_servers is not None:
+            mcp_keys, unknown_servers = await _expand_mcp_servers(client, mcp_servers)
+            if unknown_servers:
+                return {
+                    "error": (
+                        f"Unknown MCP server(s): {', '.join(unknown_servers)}. "
+                        "Use list_mcp_servers to see what LibreChat has enumerated."
+                    )
+                }
+            body["tools"] = [*(body.get("tools") or []), *mcp_keys]
+
         if not body:
             return {"error": "No fields to update — provide at least one field to change"}
+
+        requested_tools = body.get("tools")
         data = await client.request("PATCH", f"/api/agents/{agent_id}", json=body)
-        log.info("update_agent", agent_id=agent_id, fields=list(body.keys()))
-        return _as_dict(data, plural="agents")
+        result = _as_dict(data, plural="agents")
+        dropped = _dropped_tools(requested_tools, result)
+        if dropped:
+            result["dropped_tools"] = dropped
+            result["warning"] = (
+                f"LibreChat silently dropped {len(dropped)} requested tool(s) on a "
+                "successful update — they are unknown or not authorised for this "
+                "account."
+            )
+        log.info(
+            "update_agent",
+            agent_id=agent_id,
+            fields=sorted(body.keys()),
+            mcp_servers=mcp_servers,
+            dropped_tools=dropped or None,
+        )
+        return result
     except Exception as e:
         return _tool_error("update_agent", e)
 
@@ -361,6 +666,81 @@ async def list_tools() -> dict:
         return _as_dict(data, plural="tools")
     except Exception as e:
         return _tool_error("list_tools", e)
+
+
+@mcp.tool
+@instrument("list_mcp_tools")
+async def list_mcp_tools(server: str = "") -> dict:
+    """List the MCP server tools an agent can be given, keyed by server name.
+
+    Returns `{"servers": {<name>: [pluginKey, ...]}, "count": N}`. These pluginKeys —
+    shaped `${toolName}_mcp_${serverName}` — are what `create_agent(tools=)` takes,
+    and passing them is what makes LibreChat derive `mcpServerNames`.
+
+    Distinct from `list_tools`, which covers LibreChat's built-in tools only and lists
+    no MCP tool at all. Most callers should use `create_agent(mcp_servers=['searxng'])`
+    and let it expand these keys.
+
+    Args:
+        server: Restrict to one server name. Empty returns every enumerated server.
+    """
+    try:
+        client = get_client()  # inside the try — see _CLIENT_INSIDE_TRY
+        by_server = await _mcp_server_tools(client)
+        if server:
+            if server not in by_server:
+                return {
+                    "error": (
+                        f"Unknown MCP server: {server}. "
+                        f"LibreChat has enumerated: {', '.join(sorted(by_server)) or '(none)'}"
+                    )
+                }
+            by_server = {server: by_server[server]}
+        return {"servers": by_server, "count": sum(len(v) for v in by_server.values())}
+    except Exception as e:
+        return _tool_error("list_mcp_tools", e)
+
+
+@mcp.tool
+@instrument("list_mcp_servers")
+async def list_mcp_servers() -> dict:
+    """List LibreChat's configured MCP servers with their connection state.
+
+    Returns `{"servers": [{name, connectionState, tool_count, ...}], "count": N}`.
+
+    **`connectionState: "disconnected"` is the normal idle state and is not, on its
+    own, a fault** — a server can read `disconnected` while a tool call through it
+    succeeds. Judge it against `tool_count`: a server enumerating tools is usable.
+
+    Known live discrepancy (vikunja#662): a server whose `headers` block in
+    librechat.yaml carries a `{{...}}` placeholder gets no `toolFunctions` in
+    LibreChat's registry, so it cannot deliver tools at chat time even where the tool
+    catalogue still lists them. On forge that is `jobsearch`; `searxng` is unaffected.
+    """
+    try:
+        client = get_client()  # inside the try — see _CLIENT_INSIDE_TRY
+        configured = await client.request("GET", "/api/mcp/servers")
+        status = await client.request("GET", "/api/mcp/connection/status")
+        if not isinstance(configured, dict):
+            return {"servers": [], "count": 0}
+        states = status.get("connectionStatus") if isinstance(status, dict) else None
+        states = states if isinstance(states, dict) else {}
+        by_server = await _mcp_server_tools(client)
+        servers = [
+            {
+                "name": name,
+                "connectionState": (states.get(name) or {}).get("connectionState"),
+                "requiresOAuth": spec.get("requiresOAuth"),
+                "transport": spec.get("type"),
+                "source": spec.get("source"),
+                "tool_count": len(by_server.get(name, [])),
+            }
+            for name, spec in configured.items()
+            if isinstance(spec, dict)
+        ]
+        return {"servers": servers, "count": len(servers)}
+    except Exception as e:
+        return _tool_error("list_mcp_servers", e)
 
 
 # ---------------------------------------------------------------------------
