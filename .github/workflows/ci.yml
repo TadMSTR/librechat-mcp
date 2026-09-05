@@ -23,7 +23,10 @@ jobs:
           python-version: ${{ matrix.python-version }}
 
       - name: Install dependencies
-        run: pip install ".[dev]" ruff==0.16.0
+        # ".[dev,otel]", not ".[dev]". With a dev-only install the OTEL tests would
+        # skip themselves into a silent green — the exact failure the extra exists
+        # to prevent (vikunja#336). They do not use importorskip for the same reason.
+        run: pip install ".[dev,otel]" ruff==0.16.0
 
       - name: Lint (ruff)
         run: ruff check .
@@ -32,7 +35,9 @@ jobs:
         run: ruff format --check .
 
       - name: Run tests
-        run: pytest --cov=librechat_mcp
+        # --cov-report=term-missing so a coverage regression names the lines it lost
+        # in the log, rather than only tripping the fail_under gate in pyproject.
+        run: pytest --cov=librechat_mcp --cov-report=term-missing
 
   audit:
     name: Dependency audit
@@ -73,3 +78,144 @@ jobs:
         run: |
           pip install dist/*.whl
           python -c "import librechat_mcp; print('install ok')"
+
+  docker-build:
+    name: Docker build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+      - uses: docker/setup-buildx-action@37fe631027851001ddb9b187196cc803df7f5f0e # v4.3.0
+      - name: Build image
+        uses: docker/build-push-action@53b7df96c91f9c12dcc8a07bcb9ccacbed38856a # v7.3.0
+        with:
+          context: .
+          push: false
+          load: true
+          tags: librechat-mcp:ci
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      # Building proves the image assembles; it does not prove it runs. Without the
+      # steps below, a broken entry point or a missing runtime dependency would first
+      # surface at tag time as a failed release, or — as with vikunja#657 — not at all.
+
+      - name: Smoke test — refuses to start with no token
+        run: |
+          set +e
+          out=$(docker run --rm librechat-mcp:ci 2>&1)
+          status=$?
+          echo "$out"
+          if [ $status -eq 0 ]; then
+            echo "::error::started with no LIBRECHAT_MCP_API_TOKEN — the fail-closed guard is gone"
+            exit 1
+          fi
+          echo "$out" | grep -q "without LIBRECHAT_MCP_API_TOKEN" || {
+            echo "::error::exited non-zero but not for the expected reason"; exit 1; }
+
+      - name: Smoke test — refuses a token under 16 chars
+        run: |
+          set +e
+          out=$(docker run --rm -e LIBRECHAT_MCP_API_TOKEN=tooshort librechat-mcp:ci 2>&1)
+          status=$?
+          echo "$out"
+          if [ $status -eq 0 ]; then
+            echo "::error::started with an 8-char token — the minimum-length guard is gone"
+            exit 1
+          fi
+          echo "$out" | grep -q "too short" || {
+            echo "::error::exited non-zero but not for the expected reason"; exit 1; }
+
+      - name: Smoke test — healthy, /health unauthenticated, everything else 401
+        run: |
+          # No LibreChat anywhere in CI, and the container must still go healthy:
+          # /health is liveness, not readiness. If this step ever needs a LibreChat
+          # service to pass, the probe has started reaching upstream and the
+          # restart-loop risk is back.
+          #
+          # --read-only mirrors the deploy fragment. If the image ever needs a
+          # writable path, this step fails here rather than on the live stack.
+          #
+          # Generated, not a literal: a hardcoded hex string is indistinguishable
+          # from a real credential to a secret scanner, and a repo carrying a
+          # permanent "expected" gitleaks hit teaches people to skip the output.
+          TOKEN="$(openssl rand -hex 16)"
+          # Host port 18496, not 8496. On a developer box 8496 is held by the LIVE
+          # librechat-mcp container, and `docker run` then fails while every curl
+          # below silently succeeds against the DEPLOYED server instead — reporting
+          # on a different container than the one under test. Cost an hour once.
+          docker run -d --name librechat-mcp-ci --read-only \
+            -p 127.0.0.1:18496:8496 \
+            -e LIBRECHAT_URL=http://librechat.invalid:3080 \
+            -e LIBRECHAT_ADMIN_EMAIL=ci@example.invalid \
+            -e LIBRECHAT_ADMIN_PASSWORD=ci-not-a-real-password \
+            -e LIBRECHAT_MCP_API_TOKEN="$TOKEN" librechat-mcp:ci || {
+              echo "::error::docker run failed — every check below would have tested nothing"
+              exit 1; }
+          for i in $(seq 1 30); do
+            [ "$(docker inspect --format '{{.State.Health.Status}}' librechat-mcp-ci)" = "healthy" ] && break
+            sleep 2
+          done
+          docker inspect --format '{{.State.Health.Status}}' librechat-mcp-ci | grep -qx healthy || {
+            echo "::error::container never became healthy"; docker logs librechat-mcp-ci; exit 1; }
+
+          # No Authorization header at all.
+          body=$(curl -fsS http://127.0.0.1:18496/health)
+          echo "$body"
+          echo "$body" | grep -q '"status":"ok"'
+          # `if grep` rather than `grep && exit 1`: the latter returns non-zero from
+          # the compound when grep finds nothing, failing the step on the success path.
+          if echo "$body" | grep -qiE "3080|8496|0\.0\.0\.0|token|email|version|librechat\."; then
+            echo "::error::/health echoed config — it is unauthenticated by design"
+            exit 1
+          fi
+
+          # The exemption must be exact-path. A startswith("/health") implementation
+          # passes the check above and fails here.
+          for p in /healthz /health/ /health-debug /mcp; do
+            code=$(curl -s -o /dev/null -w '%{http_code}' "http://127.0.0.1:18496$p")
+            [ "$code" = "401" ] || {
+              echo "::error::$p returned $code, expected 401 — the auth exemption is too broad"
+              docker rm -f librechat-mcp-ci; exit 1; }
+            echo "$p -> 401"
+          done
+
+          # A correct token must actually get through — "everything 401s" is also
+          # what a totally broken server looks like.
+          code=$(curl -s -o /dev/null -w '%{http_code}' -X POST \
+            -H "Authorization: Bearer $TOKEN" \
+            -H "Content-Type: application/json" \
+            -H "Accept: application/json, text/event-stream" \
+            -d '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-06-18","capabilities":{},"clientInfo":{"name":"ci","version":"0"}}}' \
+            http://127.0.0.1:18496/mcp)
+          [ "$code" != "401" ] || {
+            echo "::error::a valid token was rejected — auth is failing closed on everything"
+            docker logs librechat-mcp-ci; docker rm -f librechat-mcp-ci; exit 1; }
+          echo "initialize with a valid token -> $code"
+
+          # And a WRONG token must be refused. Without this the check above passes
+          # just as well with the middleware removed entirely, which is the exact
+          # shape of "the guard landed but never reached".
+          wrong=$(curl -s -o /dev/null -w '%{http_code}' -X POST \
+            -H "Authorization: Bearer $(openssl rand -hex 16)" \
+            -H "Content-Type: application/json" \
+            -H "Accept: application/json, text/event-stream" \
+            -d '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-06-18","capabilities":{},"clientInfo":{"name":"ci","version":"0"}}}' \
+            http://127.0.0.1:18496/mcp)
+          [ "$wrong" = "401" ] || {
+            echo "::error::a wrong token returned $wrong, expected 401 — auth is not enforcing"
+            docker logs librechat-mcp-ci; docker rm -f librechat-mcp-ci; exit 1; }
+          echo "initialize with a wrong token -> 401"
+
+          # The server must emit structured JSON logs. It emitted none at all for the
+          # whole of v0.1.x, which is a large part of why #657 went unnoticed.
+          docker logs librechat-mcp-ci 2>&1 | grep -q '"event": *"librechat_mcp_starting"' || {
+            echo "::error::no structured startup log line — configure_logging is not wired"
+            docker logs librechat-mcp-ci; docker rm -f librechat-mcp-ci; exit 1; }
+
+          docker rm -f librechat-mcp-ci
+
+      - name: Verify the image runs as non-root
+        run: |
+          uid=$(docker run --rm --entrypoint id librechat-mcp:ci -u)
+          [ "$uid" != "0" ] || { echo "::error::image runs as root"; exit 1; }
+          echo "runs as uid $uid"

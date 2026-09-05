@@ -1,0 +1,103 @@
+# librechat-mcp — compose service fragment for the `librechat` stack.
+#
+# THIS IS NOT A RUNNABLE STACK. It is the service block to merge into
+# ~/docker/librechat/docker-compose.yml, replacing the `librechat-mcp` service
+# already there.
+#
+# It lives in the repo rather than in ~/docker because developer has no write grant
+# there — /etc/forge/workspace-policy.yml gives developer
+# write_roots: [~/repos/gitea, ~/repos/personal], and ~/docker is sysadmin's alone.
+# Merging it is a sysadmin action.
+#
+# ============================================================================
+# THIS IS A PAIRED CHANGE. Merging the repo alone will take the service DOWN.
+# ============================================================================
+# v0.2.0 refuses to start without LIBRECHAT_MCP_API_TOKEN (>= 16 chars). That is
+# deliberate — see the note beside the variable below — but it means the sequence
+# matters:
+#
+#   1. add LIBRECHAT_MCP_TOKEN to ~/docker/librechat/.env  (mode 600, gitignored)
+#   2. merge this service block
+#   3. docker compose pull && docker compose up -d librechat-mcp
+#
+# `docker compose restart` will NOT pick up the new image — docker-publish.yml
+# republishes `:latest` on every push to main but redeploys nothing, and that gap is
+# exactly where a "fixed" service stays broken (vikunja#657).
+
+services:
+  librechat-mcp:
+    # Pin the tag. `:latest` also exists and is what the service ran until v0.2.0 —
+    # which meant the deployed artefact moved whenever main moved, while the running
+    # container did not, so what was deployed and what was running could silently
+    # disagree.
+    image: ghcr.io/tadmstr/librechat-mcp:v0.2.0
+    container_name: librechat-mcp
+    depends_on:
+      - librechat
+    restart: unless-stopped
+    user: "1000:1000"
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    # No writable path is needed: logs go to stdout and there is no cache, no state
+    # and no audit log. If a future change needs a mount, something about the
+    # stdout-only logging has regressed — fix that rather than dropping this line.
+    read_only: true
+    ports:
+      # Loopback-only. THIS is the network control; the bearer token below is the
+      # access control, and neither substitutes for the other. Note the bind address
+      # INSIDE the container is 0.0.0.0 and must stay so: a container binding its own
+      # loopback is unreachable even through this publish (measured — docker-proxy
+      # dials the container IP, not its loopback).
+      - "127.0.0.1:8496:8496"
+    environment:
+      # Container-to-container by service name on librechat-internal. NOT
+      # localhost:3080 — that is this container's own loopback, where nothing is
+      # listening.
+      - LIBRECHAT_URL=http://librechat:3080
+      - LIBRECHAT_ADMIN_EMAIL=${LIBRECHAT_MCP_EMAIL}
+      - LIBRECHAT_ADMIN_PASSWORD=${LIBRECHAT_MCP_PASSWORD}
+      - MCP_PORT=8496
+      # MANDATORY, minimum 16 characters — the process refuses to start without a
+      # conforming token, so there is no silent unauthenticated mode to fall into.
+      #
+      # Until v0.2.0 there was no auth at all, and an unauthenticated `initialize`
+      # was verified returning 200 from a throwaway container on librechat-internal —
+      # the same network the LibreChat app itself is on. Full agent CRUD, including
+      # delete_agent, against the instance the whole fleet is built on.
+      #
+      # Set LIBRECHAT_MCP_TOKEN in ~/docker/librechat/.env (mode 600, gitignored —
+      # so note that reverting the compose file does NOT revert it).
+      # Generate with: python3 -c "import secrets; print(secrets.token_hex(32))"
+      - LIBRECHAT_MCP_API_TOKEN=${LIBRECHAT_MCP_TOKEN}
+      - LOG_LEVEL=INFO
+      # LOG_FILE is deliberately absent and must stay absent — logs go to stdout,
+      # which is what makes read_only: true above viable.
+      #
+      # OTEL_EXPORTER_OTLP_ENDPOINT is deliberately absent too. Wiring this fleet to
+      # SigNoz is deferred and tracked as vikunja#667; when it lands, the value is
+      # gRPC 4317 and the SERVICE NAME, not localhost:
+      #   OTEL_EXPORTER_OTLP_ENDPOINT=http://signoz-otel-collector:4317
+      # 4318 is the HTTP port and fails silently — observability.py imports the grpc
+      # exporter.
+    networks:
+      # librechat-internal ONLY, as today. This service needs to reach `librechat`
+      # and nothing else, and nothing on forge-net has any business reaching it.
+      - librechat-internal
+    # With no app-side file handler, this block IS the log rotation mechanism. Before
+    # v0.2.0 the container emitted no application log lines at all, so this was moot;
+    # it is not any more.
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "5m"
+        max-file: "2"
+    mem_limit: 256m
+    cpus: "0.5"
+
+# For reference only — the target stack already declares this. Do not duplicate it
+# when merging; take the service block above and nothing else.
+networks:
+  librechat-internal:
+    external: false
